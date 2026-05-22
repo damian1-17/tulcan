@@ -139,4 +139,56 @@ export class DashboardController {
   getConcentracionCartera(): Promise<ConcentracionResponseDto> {
     return this.dashboardService.getConcentracionCartera();
   }
+
+  @Get('retencion')
+  @ApiOperation({
+    summary: 'Retención de Socios',
+    description: 'Identifica socios con riesgo de desvinculación y fuga de liquidez, basado en inactividad transaccional, saldo disponible, vinculación crediticia y uso de canales digitales.',
+  })
+  @ApiQuery({ name: 'page',   required: false, example: 1,      description: 'Página (por defecto: 1)' })
+  @ApiQuery({ name: 'limit',  required: false, example: 20,     description: 'Límite por página (por defecto: 20, máx 100)' })
+  @ApiQuery({ name: 'riesgo', required: false, example: 'Alto', description: 'Filtrar por nivel: Bajo | Medio | Alto' })
+  @ApiResponse({ status: 200, type: RetencionResponseDto })
+  getRetencionSocios(
+    @Query('page')   page?:   string,
+    @Query('limit')  limit?:  string,
+    @Query('riesgo') riesgo?: string,
+  ): Promise<RetencionResponseDto> {
+    const pageNum  = page  ? parseInt(page,  10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 20;
+
+    if (isNaN(pageNum)  || pageNum  <= 0) throw new BadRequestException('El parámetro page debe ser mayor a 0');
+    if (isNaN(limitNum) || limitNum <= 0) throw new BadRequestException('El parámetro limit debe ser mayor a 0');
+    if (limitNum > 100)                   throw new BadRequestException('El parámetro limit no puede superar 100');
+    if (riesgo && !['Bajo', 'Medio', 'Alto'].includes(riesgo))
+      throw new BadRequestException('riesgo debe ser Bajo, Medio o Alto');
+
+    return this.dashboardService.getRetencionSocios(pageNum, limitNum, riesgo);
+  }
+
+  @Get('recuperabilidad')
+  @ApiOperation({
+    summary: 'Recuperabilidad de Cartera Vencida',
+    description: 'Predice la probabilidad de recuperación de créditos vencidos basándose en garantías, ingresos declarados, saldo de ahorro disponible y días de mora.',
+  })
+  @ApiQuery({ name: 'page',     required: false, example: 1,      description: 'Página (por defecto: 1)' })
+  @ApiQuery({ name: 'limit',    required: false, example: 20,     description: 'Límite por página (por defecto: 20, máx 100)' })
+  @ApiQuery({ name: 'segmento', required: false, example: 'Alta', description: 'Filtrar por segmento: Alta | Media | Baja' })
+  @ApiResponse({ status: 200, type: RecuperabilidadResponseDto })
+  getRecuperabilidadCartera(
+    @Query('page')     page?:     string,
+    @Query('limit')    limit?:    string,
+    @Query('segmento') segmento?: string,
+  ): Promise<RecuperabilidadResponseDto> {
+    const pageNum  = page  ? parseInt(page,  10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 20;
+
+    if (isNaN(pageNum)  || pageNum  <= 0) throw new BadRequestException('El parámetro page debe ser mayor a 0');
+    if (isNaN(limitNum) || limitNum <= 0) throw new BadRequestException('El parámetro limit debe ser mayor a 0');
+    if (limitNum > 100)                   throw new BadRequestException('El parámetro limit no puede superar 100');
+    if (segmento && !['Alta', 'Media', 'Baja'].includes(segmento))
+      throw new BadRequestException('segmento debe ser Alta, Media o Baja');
+
+    return this.dashboardService.getRecuperabilidadCartera(pageNum, limitNum, segmento);
+  }
 }

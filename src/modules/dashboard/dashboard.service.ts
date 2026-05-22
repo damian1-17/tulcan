@@ -19,6 +19,8 @@ import {
   CuotasRiesgoResponseDto,
   ConcentracionResponseDto,
   CuotaRiesgoDto,
+  RetencionResponseDto,
+  RecuperabilidadResponseDto,
 } from './dto/dashboard-response.dto';
 
 @Injectable()
@@ -1430,6 +1432,483 @@ export class DashboardService {
 
     } catch (error) {
       this.logger.error('Error en getConcentracionCartera', error);
+      throw error;
+    }
+  }
+
+  // ─── Retención de Socios ───────────────────────────────────────────────────
+
+  /**
+   * Identifica socios con riesgo de desvinculación (fuga de liquidez).
+   * Señales: inactividad transaccional, saldo bajo, sin crédito activo, sin canales digitales.
+   */
+  async getRetencionSocios(
+    page: number,
+    limit: number,
+    riesgo?: string,
+  ): Promise<RetencionResponseDto> {
+    try {
+      const offset = (page - 1) * limit;
+
+      let nivelFilter = '';
+      if (riesgo === 'Alto')  nivelFilter = "AND nivel_riesgo = 'Alto'";
+      if (riesgo === 'Medio') nivelFilter = "AND nivel_riesgo = 'Medio'";
+      if (riesgo === 'Bajo')  nivelFilter = "AND nivel_riesgo = 'Bajo'";
+
+      const sql = `
+        WITH
+        max_ahorro AS (
+          SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro
+        ),
+        prev_ahorro AS (
+          SELECT fecha_proceso AS fecha FROM sabana_ahorro
+          GROUP BY fecha_proceso ORDER BY fecha_proceso DESC OFFSET 1 LIMIT 1
+        ),
+        max_credito AS (
+          SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito
+        ),
+        base_ahorro AS (
+          SELECT DISTINCT ON (v_ah_cliente)
+            v_ah_cliente,
+            v_ah_nombre,
+            saldo_disponible,
+            fecha_proceso
+          FROM sabana_ahorro
+          WHERE fecha_proceso = (SELECT fecha FROM max_ahorro)
+          ORDER BY v_ah_cliente, saldo_disponible DESC
+        ),
+        prev_base AS (
+          SELECT DISTINCT ON (v_ah_cliente)
+            v_ah_cliente,
+            fecha_proceso AS fecha_prev
+          FROM sabana_ahorro
+          WHERE fecha_proceso = (SELECT fecha FROM prev_ahorro)
+          ORDER BY v_ah_cliente
+        ),
+        ultima_tx AS (
+          SELECT
+            CAST(nro_cliente AS BIGINT) AS v_ah_cliente,
+            MAX(fecha_trn) AS ultima_fecha_tx
+          FROM transacciones
+          WHERE nro_cliente IS NOT NULL
+          GROUP BY nro_cliente
+        ),
+        credito_activo AS (
+          SELECT DISTINCT nro_cliente
+          FROM sabana_credito
+          WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
+            AND estado_op = 'VIGENTE'
+            AND saldo_capital > 0
+        ),
+        cooplinea AS (
+          -- Socios que tienen registro de uso de Cooplinea en sabana_ahorro
+          SELECT DISTINCT CAST(v_ah_cliente AS BIGINT) AS v_ah_cliente
+          FROM sabana_ahorro
+          WHERE fecha_proceso = (SELECT fecha FROM max_ahorro)
+            AND UPPER(COALESCE(cooplinea, '')) IN ('SI', 'S', '1', 'TRUE', 'X')
+        ),
+        scoring AS (
+          SELECT
+            a.v_ah_cliente,
+            a.v_ah_nombre,
+            a.saldo_disponible,
+            COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso) AS ultima_fecha_mov,
+            GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) AS dias_inactividad,
+            (ca.nro_cliente IS NOT NULL)  AS tiene_credito,
+            (cl.v_ah_cliente IS NOT NULL) AS tiene_cooplinea,
+            -- Score de fuga (0=sin riesgo, 100=máximo riesgo)
+            LEAST(100, GREATEST(0,
+              -- Factor inactividad (35 pts)
+              CASE
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 180 THEN 35
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 90  THEN 25
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 60  THEN 15
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 30  THEN 8
+                ELSE 0
+              END +
+              -- Factor saldo bajo (30 pts)
+              CASE
+                WHEN a.saldo_disponible < 10   THEN 30
+                WHEN a.saldo_disponible < 50   THEN 22
+                WHEN a.saldo_disponible < 200  THEN 12
+                WHEN a.saldo_disponible < 500  THEN 5
+                ELSE 0
+              END +
+              -- Sin crédito activo (20 pts)
+              CASE WHEN ca.nro_cliente IS NULL THEN 20 ELSE 0 END +
+              -- Sin canales digitales (15 pts)
+              CASE WHEN cl.v_ah_cliente IS NULL THEN 15 ELSE 0 END
+            )) AS score_fuga
+          FROM base_ahorro a
+          LEFT JOIN ultima_tx     tx ON a.v_ah_cliente = tx.v_ah_cliente
+          LEFT JOIN prev_base     p  ON a.v_ah_cliente = p.v_ah_cliente
+          LEFT JOIN credito_activo ca ON CAST(a.v_ah_cliente AS BIGINT)::TEXT = ca.nro_cliente
+          LEFT JOIN cooplinea     cl ON a.v_ah_cliente = cl.v_ah_cliente
+        ),
+        resultado AS (
+          SELECT
+            v_ah_cliente,
+            v_ah_nombre,
+            saldo_disponible,
+            ultima_fecha_mov,
+            dias_inactividad,
+            tiene_credito,
+            tiene_cooplinea,
+            score_fuga,
+            ROUND(CAST(100.0 / (1.0 + EXP(-0.10 * (score_fuga - 50))) AS NUMERIC), 1) AS prob_fuga,
+            CASE
+              WHEN score_fuga >= 70 THEN 'Alto'
+              WHEN score_fuga >= 40 THEN 'Medio'
+              ELSE 'Bajo'
+            END AS nivel_riesgo,
+            CASE
+              WHEN score_fuga >= 70 AND saldo_disponible < 10
+                THEN 'Inactividad extrema + saldo vaciado y sin crédito vinculado'
+              WHEN score_fuga >= 70
+                THEN 'Inactividad prolongada + bajo saldo + sin canales digitales'
+              WHEN dias_inactividad > 90 AND saldo_disponible < 50
+                THEN 'Más de 90 días sin movimientos y saldo casi en cero'
+              WHEN tiene_credito = false AND tiene_cooplinea = false AND saldo_disponible < 200
+                THEN 'Sin crédito, sin canales digitales y saldo reducido'
+              WHEN dias_inactividad > 60
+                THEN 'Sin actividad transaccional en ' || dias_inactividad::TEXT || ' días'
+              ELSE 'Indicadores de fuga en nivel medio'
+            END AS motivo_principal
+          FROM scoring
+        )
+        SELECT
+          v_ah_cliente,
+          v_ah_nombre,
+          saldo_disponible,
+          ultima_fecha_mov,
+          dias_inactividad,
+          tiene_credito,
+          tiene_cooplinea,
+          prob_fuga,
+          nivel_riesgo,
+          motivo_principal
+        FROM resultado
+        WHERE 1=1 ${nivelFilter}
+        ORDER BY score_fuga DESC
+        LIMIT $1 OFFSET $2;
+      `;
+
+      const sqlResumen = `
+        WITH
+        max_ahorro AS (SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro),
+        prev_ahorro AS (
+          SELECT fecha_proceso AS fecha FROM sabana_ahorro
+          GROUP BY fecha_proceso ORDER BY fecha_proceso DESC OFFSET 1 LIMIT 1
+        ),
+        max_credito AS (SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito),
+        base_ahorro AS (
+          SELECT DISTINCT ON (v_ah_cliente) v_ah_cliente, v_ah_nombre, saldo_disponible, fecha_proceso
+          FROM sabana_ahorro WHERE fecha_proceso = (SELECT fecha FROM max_ahorro)
+          ORDER BY v_ah_cliente, saldo_disponible DESC
+        ),
+        ultima_tx AS (
+          SELECT CAST(nro_cliente AS BIGINT) AS v_ah_cliente, MAX(fecha_trn) AS ultima_fecha_tx
+          FROM transacciones WHERE nro_cliente IS NOT NULL GROUP BY nro_cliente
+        ),
+        prev_base AS (
+          SELECT DISTINCT ON (v_ah_cliente) v_ah_cliente, fecha_proceso AS fecha_prev
+          FROM sabana_ahorro WHERE fecha_proceso = (SELECT fecha FROM prev_ahorro) ORDER BY v_ah_cliente
+        ),
+        credito_activo AS (
+          SELECT DISTINCT nro_cliente FROM sabana_credito
+          WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
+            AND estado_op = 'VIGENTE' AND saldo_capital > 0
+        ),
+        cooplinea AS (
+          SELECT DISTINCT CAST(v_ah_cliente AS BIGINT) AS v_ah_cliente
+          FROM sabana_ahorro
+          WHERE fecha_proceso = (SELECT fecha FROM max_ahorro)
+            AND UPPER(COALESCE(cooplinea, '')) IN ('SI', 'S', '1', 'TRUE', 'X')
+        ),
+        scoring AS (
+          SELECT
+            a.saldo_disponible,
+            LEAST(100, GREATEST(0,
+              CASE
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 180 THEN 35
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 90  THEN 25
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 60  THEN 15
+                WHEN GREATEST(0, DATE_PART('day', NOW() - COALESCE(tx.ultima_fecha_tx, p.fecha_prev, a.fecha_proceso))::INT) > 30  THEN 8
+                ELSE 0
+              END +
+              CASE WHEN a.saldo_disponible < 10 THEN 30 WHEN a.saldo_disponible < 50 THEN 22
+                   WHEN a.saldo_disponible < 200 THEN 12 WHEN a.saldo_disponible < 500 THEN 5 ELSE 0 END +
+              CASE WHEN ca.nro_cliente IS NULL THEN 20 ELSE 0 END +
+              CASE WHEN cl.v_ah_cliente IS NULL THEN 15 ELSE 0 END
+            )) AS score_fuga
+          FROM base_ahorro a
+          LEFT JOIN ultima_tx     tx ON a.v_ah_cliente = tx.v_ah_cliente
+          LEFT JOIN prev_base     p  ON a.v_ah_cliente = p.v_ah_cliente
+          LEFT JOIN credito_activo ca ON CAST(a.v_ah_cliente AS BIGINT)::TEXT = ca.nro_cliente
+          LEFT JOIN cooplinea     cl ON a.v_ah_cliente = cl.v_ah_cliente
+        )
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN score_fuga >= 70 THEN 1 ELSE 0 END) AS total_alto,
+          SUM(CASE WHEN score_fuga >= 40 AND score_fuga < 70 THEN 1 ELSE 0 END) AS total_medio,
+          SUM(CASE WHEN score_fuga >= 40 THEN saldo_disponible ELSE 0 END) AS saldo_en_riesgo
+        FROM scoring;
+      `;
+
+      const [rows, resRows] = await Promise.all([
+        this.sabanaAhorroRepo.query(sql, [limit, offset]),
+        this.sabanaAhorroRepo.query(sqlResumen),
+      ]);
+
+      const res = resRows[0];
+
+      return {
+        resumen: {
+          totalRiesgoAlto:  parseInt(res?.total_alto  ?? '0', 10),
+          totalRiesgoMedio: parseInt(res?.total_medio ?? '0', 10),
+          saldoEnRiesgo:    parseFloat(res?.saldo_en_riesgo ?? '0'),
+        },
+        data: rows.map((r: any) => ({
+          nroCliente:         String(Math.floor(parseFloat(r.v_ah_cliente))),
+          nombresSocio:       r.v_ah_nombre ?? '',
+          saldoAhorro:        parseFloat(r.saldo_disponible ?? '0'),
+          diasInactividad:    parseInt(r.dias_inactividad ?? '0', 10),
+          fechaUltMovimiento: r.ultima_fecha_mov ? new Date(r.ultima_fecha_mov).toISOString() : null,
+          tieneCredito:       r.tiene_credito === true || r.tiene_credito === 't',
+          tieneCooplinea:     r.tiene_cooplinea === true || r.tiene_cooplinea === 't',
+          probabilidadFuga:   parseFloat(r.prob_fuga ?? '0'),
+          nivelRiesgo:        r.nivel_riesgo ?? 'Bajo',
+          motivoPrincipal:    r.motivo_principal ?? '',
+        })),
+        page,
+        limit,
+        total: parseInt(res?.total ?? '0', 10),
+      };
+    } catch (error) {
+      this.logger.error('Error en getRetencionSocios', error);
+      throw error;
+    }
+  }
+
+  // ─── Recuperabilidad de Cartera Vencida ────────────────────────────────────
+
+  /**
+   * Predice la probabilidad de recuperación de créditos vencidos.
+   * Factores: garantías, historial, ingresos, días de mora, saldo disponible.
+   */
+  async getRecuperabilidadCartera(
+    page: number,
+    limit: number,
+    segmento?: string,
+  ): Promise<RecuperabilidadResponseDto> {
+    try {
+      const offset = (page - 1) * limit;
+
+      let segFilter = '';
+      if (segmento === 'Alta')  segFilter = "AND segmento = 'Alta'";
+      if (segmento === 'Media') segFilter = "AND segmento = 'Media'";
+      if (segmento === 'Baja')  segFilter = "AND segmento = 'Baja'";
+
+      const sql = `
+        WITH
+        max_credito AS (SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito),
+        max_ahorro  AS (SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro),
+        creditos_mora AS (
+          SELECT
+            nro_cliente,
+            nro_operacion,
+            nombres_socio,
+            COALESCE(CAST(NULLIF(dias_mora,'') AS FLOAT), 0)        AS dias_mora,
+            saldo_capital,
+            COALESCE(CAST(NULLIF(saldo_vencido,'') AS FLOAT), 0)           AS saldo_vencido,
+            COALESCE(tgarantia, '')                                  AS tgarantia,
+            COALESCE(CAST(NULLIF(valgarantias,'') AS FLOAT), 0)     AS val_garantias,
+            COALESCE(CAST(NULLIF(monto_credito,'') AS FLOAT), 0)    AS monto_credito,
+            COALESCE(CAST(NULLIF(ingresos_socio,'') AS FLOAT), 0)   AS ingresos,
+            COALESCE(CAST(NULLIF(nro_cuotas_atra,'') AS FLOAT), 0)  AS cuotas_atra,
+            calificacion
+          FROM sabana_credito
+          WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
+            AND COALESCE(CAST(NULLIF(dias_mora,'') AS FLOAT), 0) > 0
+        ),
+        ahorro_socio AS (
+          SELECT DISTINCT ON (v_ah_cliente)
+            v_ah_cliente, saldo_disponible
+          FROM sabana_ahorro
+          WHERE fecha_proceso = (SELECT fecha FROM max_ahorro)
+          ORDER BY v_ah_cliente, saldo_disponible DESC
+        ),
+        scoring AS (
+          SELECT
+            c.nro_cliente,
+            c.nro_operacion,
+            c.nombres_socio,
+            c.dias_mora,
+            COALESCE(c.saldo_vencido, c.saldo_capital * 0.3) AS saldo_vencido,
+            c.tgarantia,
+            c.ingresos,
+            -- Score recuperación (0=imposible, 100=muy probable)
+            LEAST(100, GREATEST(0,
+              -- Garantía fuerte (+40 pts)
+              CASE
+                WHEN UPPER(c.tgarantia) LIKE '%HIPOTECARIA%' THEN 40
+                WHEN UPPER(c.tgarantia) LIKE '%PRENDARIA%'   THEN 30
+                WHEN UPPER(c.tgarantia) LIKE '%PERSONAL%'    THEN 20
+                WHEN UPPER(c.tgarantia) LIKE '%QUIROG%'      THEN 10
+                ELSE 5
+              END +
+              -- Cobertura de garantía (+20 pts)
+              CASE
+                WHEN c.monto_credito > 0 AND c.val_garantias >= c.monto_credito * 1.5 THEN 20
+                WHEN c.monto_credito > 0 AND c.val_garantias >= c.monto_credito        THEN 14
+                WHEN c.monto_credito > 0 AND c.val_garantias >= c.monto_credito * 0.5  THEN 8
+                ELSE 0
+              END +
+              -- Ingresos declarados (+20 pts)
+              CASE
+                WHEN c.ingresos > 2000 THEN 20
+                WHEN c.ingresos > 1000 THEN 14
+                WHEN c.ingresos > 500  THEN 8
+                WHEN c.ingresos > 0    THEN 4
+                ELSE 0
+              END +
+              -- Saldo ahorro disponible (+10 pts)
+              CASE
+                WHEN COALESCE(a.saldo_disponible, 0) > 500  THEN 10
+                WHEN COALESCE(a.saldo_disponible, 0) > 100  THEN 6
+                WHEN COALESCE(a.saldo_disponible, 0) > 0    THEN 2
+                ELSE 0
+              END +
+              -- Días de mora (penalización, -0 a -30 pts)
+              CASE
+                WHEN c.dias_mora <= 30  THEN 10
+                WHEN c.dias_mora <= 60  THEN 4
+                WHEN c.dias_mora <= 90  THEN 0
+                WHEN c.dias_mora <= 180 THEN -10
+                ELSE -30
+              END
+            )) AS score_recuperacion
+          FROM creditos_mora c
+          LEFT JOIN ahorro_socio a ON CAST(c.nro_cliente AS BIGINT) = a.v_ah_cliente
+        ),
+        resultado AS (
+          SELECT
+            nro_cliente,
+            nro_operacion,
+            nombres_socio,
+            dias_mora,
+            saldo_vencido,
+            tgarantia,
+            ingresos,
+            score_recuperacion,
+            CASE
+              WHEN score_recuperacion >= 60 THEN 'Alta'
+              WHEN score_recuperacion >= 30 THEN 'Media'
+              ELSE 'Baja'
+            END AS segmento,
+            CASE
+              WHEN score_recuperacion >= 60 AND UPPER(tgarantia) LIKE '%HIPOTECARIA%'
+                THEN 'Garantía hipotecaria sólida + ingresos suficientes'
+              WHEN score_recuperacion >= 60
+                THEN 'Buen respaldo de garantías e ingresos declarados'
+              WHEN score_recuperacion >= 40
+                THEN 'Garantía parcial con capacidad de pago limitada'
+              WHEN score_recuperacion >= 30
+                THEN 'Posibilidad de acuerdo de pago — bajo respaldo'
+              ELSE 'Alto riesgo de incobrabilidad — gestión judicial recomendada'
+            END AS factor_positivo
+          FROM scoring
+        )
+        SELECT
+          nro_cliente, nro_operacion, nombres_socio, dias_mora, saldo_vencido,
+          tgarantia, ingresos, score_recuperacion, segmento, factor_positivo
+        FROM resultado
+        WHERE 1=1 ${segFilter}
+        ORDER BY score_recuperacion DESC
+        LIMIT $1 OFFSET $2;
+      `;
+
+      const sqlResumen = `
+        WITH
+        max_credito AS (SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito),
+        creditos_mora AS (
+          SELECT
+            nro_cliente, nro_operacion,
+            COALESCE(CAST(NULLIF(dias_mora,'') AS FLOAT), 0)       AS dias_mora,
+            saldo_capital,
+            COALESCE(CAST(NULLIF(saldo_vencido,'') AS FLOAT), 0)      AS saldo_vencido,
+            COALESCE(tgarantia,'')                                 AS tgarantia,
+            COALESCE(CAST(NULLIF(valgarantias,'') AS FLOAT), 0)    AS val_garantias,
+            COALESCE(CAST(NULLIF(monto_credito,'') AS FLOAT), 0)   AS monto_credito,
+            COALESCE(CAST(NULLIF(ingresos_socio,'') AS FLOAT), 0)  AS ingresos
+          FROM sabana_credito
+          WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
+            AND COALESCE(CAST(NULLIF(dias_mora,'') AS FLOAT), 0) > 0
+        ),
+        scoring AS (
+          SELECT
+            COALESCE(saldo_vencido, saldo_capital * 0.3) AS sv,
+            LEAST(100, GREATEST(0,
+              CASE WHEN UPPER(tgarantia) LIKE '%HIPOTECARIA%' THEN 40
+                   WHEN UPPER(tgarantia) LIKE '%PRENDARIA%'   THEN 30
+                   WHEN UPPER(tgarantia) LIKE '%PERSONAL%'    THEN 20
+                   WHEN UPPER(tgarantia) LIKE '%QUIROG%'      THEN 10
+                   ELSE 5 END +
+              CASE WHEN monto_credito > 0 AND val_garantias >= monto_credito * 1.5 THEN 20
+                   WHEN monto_credito > 0 AND val_garantias >= monto_credito        THEN 14
+                   WHEN monto_credito > 0 AND val_garantias >= monto_credito * 0.5  THEN 8 ELSE 0 END +
+              CASE WHEN ingresos > 2000 THEN 20 WHEN ingresos > 1000 THEN 14
+                   WHEN ingresos > 500  THEN 8  WHEN ingresos > 0    THEN 4 ELSE 0 END +
+              CASE WHEN dias_mora <= 30 THEN 10 WHEN dias_mora <= 60 THEN 4
+                   WHEN dias_mora <= 90 THEN 0  WHEN dias_mora <= 180 THEN -10 ELSE -30 END
+            )) AS score_recuperacion
+          FROM creditos_mora
+        )
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN score_recuperacion >= 60 THEN 1 ELSE 0 END) AS total_alta,
+          SUM(CASE WHEN score_recuperacion >= 30 AND score_recuperacion < 60 THEN 1 ELSE 0 END) AS total_media,
+          SUM(CASE WHEN score_recuperacion < 30 THEN 1 ELSE 0 END) AS total_baja,
+          SUM(CASE WHEN score_recuperacion >= 60 THEN sv ELSE 0 END) AS monto_alta,
+          SUM(CASE WHEN score_recuperacion >= 30 AND score_recuperacion < 60 THEN sv ELSE 0 END) AS monto_media,
+          SUM(CASE WHEN score_recuperacion < 30 THEN sv ELSE 0 END) AS monto_baja
+        FROM scoring;
+      `;
+
+      const [rows, resRows] = await Promise.all([
+        this.sabanaCreditoRepo.query(sql, [limit, offset]),
+        this.sabanaCreditoRepo.query(sqlResumen),
+      ]);
+
+      const res = resRows[0];
+
+      return {
+        resumen: {
+          totalAlta:  parseInt(res?.total_alta  ?? '0', 10),
+          totalMedia: parseInt(res?.total_media ?? '0', 10),
+          totalBaja:  parseInt(res?.total_baja  ?? '0', 10),
+          montoAlta:  parseFloat(res?.monto_alta  ?? '0'),
+          montoMedia: parseFloat(res?.monto_media ?? '0'),
+          montoBaja:  parseFloat(res?.monto_baja  ?? '0'),
+        },
+        data: rows.map((r: any) => ({
+          nroCliente:        r.nro_cliente ?? '',
+          nombresSocio:      r.nombres_socio ?? '',
+          nroOperacion:      r.nro_operacion ?? '',
+          diasMora:          parseFloat(r.dias_mora ?? '0'),
+          saldoVencido:      parseFloat(r.saldo_vencido ?? '0'),
+          tipoGarantia:      r.tgarantia ?? '',
+          segmento:          r.segmento ?? 'Baja',
+          scoreRecuperacion: parseFloat(r.score_recuperacion ?? '0'),
+          factorPositivo:    r.factor_positivo ?? '',
+          ingresos:          parseFloat(r.ingresos ?? '0'),
+        })),
+        page,
+        limit,
+        total: parseInt(res?.total ?? '0', 10),
+      };
+    } catch (error) {
+      this.logger.error('Error en getRecuperabilidadCartera', error);
       throw error;
     }
   }

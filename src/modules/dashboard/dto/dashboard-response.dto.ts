@@ -358,3 +358,137 @@ export class ConcentracionResponseDto {
   @ApiProperty({ type: [ConcentracionItemDto], description: 'Concentración por ciudad de origen' })
   porCiudad: ConcentracionItemDto[];
 }
+
+// ─── Retención de Socios ──────────────────────────────────────────────────────
+
+export class SocioRetencionDto {
+  @ApiProperty({ example: '1234567' })
+  nroCliente: string;
+
+  @ApiProperty({ example: 'SOCIO 1234567' })
+  nombresSocio: string;
+
+  @ApiProperty({ example: 150.00, description: 'Saldo disponible en cuenta de ahorro (USD)' })
+  saldoAhorro: number;
+
+  @ApiProperty({ example: 95, description: 'Días desde el último movimiento transaccional' })
+  diasInactividad: number;
+
+  @ApiProperty({ example: '2026-02-14T00:00:00.000Z', nullable: true })
+  fechaUltMovimiento: string | null;
+
+  @ApiProperty({ example: false, description: 'Indica si el socio tiene un crédito activo vigente' })
+  tieneCredito: boolean;
+
+  @ApiProperty({ example: false, description: 'Indica si el socio usa canales digitales (Cooplinea, móvil, etc.)' })
+  tieneCooplinea: boolean;
+
+  @ApiProperty({ example: 78.5, description: 'Probabilidad de fuga/desvinculación calculada mediante función sigmoide (%)' })
+  probabilidadFuga: number;
+
+  @ApiProperty({ example: 'Alto', description: 'Nivel de riesgo de fuga: Bajo | Medio | Alto' })
+  nivelRiesgo: string;
+
+  @ApiProperty({ example: 'Inactividad prolongada + bajo saldo + sin canales digitales' })
+  motivoPrincipal: string;
+}
+
+export class RetencionResumenDto {
+  @ApiProperty({ example: 1200, description: 'Total de socios con riesgo de fuga Alto (score ≥ 70)' })
+  totalRiesgoAlto: number;
+
+  @ApiProperty({ example: 4500, description: 'Total de socios con riesgo de fuga Medio (score 40-69)' })
+  totalRiesgoMedio: number;
+
+  @ApiProperty({ example: 850000.00, description: 'Suma del saldo en cuentas de socios con riesgo Alto o Medio (USD)' })
+  saldoEnRiesgo: number;
+}
+
+export class RetencionResponseDto {
+  @ApiProperty({ type: RetencionResumenDto })
+  resumen: RetencionResumenDto;
+
+  @ApiProperty({ type: [SocioRetencionDto] })
+  data: SocioRetencionDto[];
+
+  @ApiProperty({ example: 1 })
+  page: number;
+
+  @ApiProperty({ example: 20 })
+  limit: number;
+
+  @ApiProperty({ example: 5700 })
+  total: number;
+}
+
+// ─── Recuperabilidad de Cartera Vencida ───────────────────────────────────────
+
+export class SocioRecuperableDto {
+  @ApiProperty({ example: '1234567' })
+  nroCliente: string;
+
+  @ApiProperty({ example: 'SOCIO 1234567' })
+  nombresSocio: string;
+
+  @ApiProperty({ example: 'OP-00123456' })
+  nroOperacion: string;
+
+  @ApiProperty({ example: 45, description: 'Días de mora actuales' })
+  diasMora: number;
+
+  @ApiProperty({ example: 3200.00, description: 'Saldo vencido (USD)' })
+  saldoVencido: number;
+
+  @ApiProperty({ example: 'HIPOTECARIA' })
+  tipoGarantia: string;
+
+  @ApiProperty({ example: 'Alta', description: 'Segmento de recuperabilidad: Alta | Media | Baja' })
+  segmento: string;
+
+  @ApiProperty({ example: 72.5, description: 'Score de recuperación (0-100)' })
+  scoreRecuperacion: number;
+
+  @ApiProperty({ example: 'Garantía hipotecaria sólida + ingresos suficientes' })
+  factorPositivo: string;
+
+  @ApiProperty({ example: 1800.00, description: 'Ingresos declarados del socio (USD)' })
+  ingresos: number;
+}
+
+export class RecuperabilidadResumenDto {
+  @ApiProperty({ example: 320, description: 'Operaciones con Alta probabilidad de recuperación' })
+  totalAlta: number;
+
+  @ApiProperty({ example: 580, description: 'Operaciones con Media probabilidad de recuperación' })
+  totalMedia: number;
+
+  @ApiProperty({ example: 210, description: 'Operaciones con Baja probabilidad de recuperación' })
+  totalBaja: number;
+
+  @ApiProperty({ example: 1280000.00, description: 'Monto vencido en segmento Alta (USD)' })
+  montoAlta: number;
+
+  @ApiProperty({ example: 2350000.00, description: 'Monto vencido en segmento Media (USD)' })
+  montoMedia: number;
+
+  @ApiProperty({ example: 840000.00, description: 'Monto vencido en segmento Baja (USD)' })
+  montoBaja: number;
+}
+
+export class RecuperabilidadResponseDto {
+  @ApiProperty({ type: RecuperabilidadResumenDto })
+  resumen: RecuperabilidadResumenDto;
+
+  @ApiProperty({ type: [SocioRecuperableDto] })
+  data: SocioRecuperableDto[];
+
+  @ApiProperty({ example: 1 })
+  page: number;
+
+  @ApiProperty({ example: 20 })
+  limit: number;
+
+  @ApiProperty({ example: 1110 })
+  total: number;
+}
+
