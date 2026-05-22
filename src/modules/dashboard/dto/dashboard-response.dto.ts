@@ -76,50 +76,6 @@ export class TransactionVolumeDto {
   totalDebitos: number;
 }
 
-// ─── Global Balances ──────────────────────────────────────────────────────────
-
-export class GlobalBalancesDto {
-  @ApiProperty({ example: 28400000.0, description: 'Suma total de saldo_disponible en el corte más reciente' })
-  totalSaldoDisponible: number;
-
-  @ApiProperty({ example: 1200000.0, description: 'Suma total de montos bloqueados' })
-  totalMontoBloqueado: number;
-
-  @ApiProperty({ example: 350000.0, description: 'Suma de ingresos declarados de socios' })
-  totalIngresos: number;
-
-  @ApiProperty({ example: 120000.0, description: 'Suma de egresos declarados de socios' })
-  totalEgresos: number;
-
-  @ApiProperty({ example: '2026-05-01T00:00:00.000Z', description: 'Fecha de proceso del corte utilizado' })
-  fechaCorte: Date | null;
-
-  @ApiProperty({ example: 99636, description: 'Total de clientes (socios únicos) en el corte más reciente de ahorros' })
-  totalClientes: number;
-}
-
-// ─── Preventive Action Socios ──────────────────────────────────────────────────
-
-export class PreventiveActionSocioDto {
-  @ApiProperty({ example: 'C-00412', description: 'Número de cliente/socio' })
-  nroCliente: string;
-
-  @ApiProperty({ example: 'M. Andrade', description: 'Nombre del socio' })
-  nombre: string;
-
-  @ApiProperty({ example: 87, description: 'Score de riesgo preventivo' })
-  score: number;
-
-  @ApiProperty({ example: 'Crítico', description: 'Nivel de criticidad' })
-  nivel: string;
-
-  @ApiProperty({ example: 0, description: 'Días de mora actuales' })
-  diasMora: number;
-
-  @ApiProperty({ example: 'Saldo ahorro cayó 78% en 3 semanas', description: 'Señal principal de alerta' })
-  senalPrincipal: string;
-}
-
 // ─── Active Credits ─────────────────────────────────────────────────────────────
 
 export class ActiveCreditDto {
