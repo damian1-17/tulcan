@@ -749,7 +749,125 @@ export class DashboardService {
                    THEN 60 ELSE 0 END +
               CASE WHEN a.monto_bloq > 0 AND COALESCE(c.max_dias_mora, 0) > 0
                    THEN 40 ELSE 0 END
-            )) AS d5_deterioro
+            )) AS d5_deterioro,
+
+            /* Señal principal — señal específica con valores reales de la BD */
+            CASE
+              /* 1. Mora activa + caída severa de ahorros (señal combinada crítica) */
+              WHEN COALESCE(c.max_dias_mora, 0) > 30
+                   AND p.saldo_prev > 0
+                   AND a.saldo_disponible < p.saldo_prev * 0.75
+                   THEN 'Mora de ' || c.max_dias_mora::TEXT || ' días + saldo cayó ' ||
+                        ROUND(CAST((p.saldo_prev - a.saldo_disponible) / p.saldo_prev * 100 AS NUMERIC), 0)::TEXT ||
+                        '% en el último mes'
+              WHEN COALESCE(c.max_dias_mora, 0) BETWEEN 1 AND 30
+                   AND p.saldo_prev > 0
+                   AND a.saldo_disponible < p.saldo_prev * 0.75
+                   THEN 'Mora de ' || c.max_dias_mora::TEXT || ' días + caída de ahorros del ' ||
+                        ROUND(CAST((p.saldo_prev - a.saldo_disponible) / p.saldo_prev * 100 AS NUMERIC), 0)::TEXT || '%'
+
+              /* 2. Cuotas atrasadas múltiples */
+              WHEN COALESCE(c.max_cuotas_atra, 0) >= 3
+                   THEN COALESCE(c.max_cuotas_atra::TEXT, '0') || ' cuotas vencidas sin regularizar'
+              WHEN COALESCE(c.max_cuotas_atra, 0) = 2
+                   THEN '2 cuotas vencidas — micro-retrasos 2 meses consecutivos'
+
+              /* 3. Caída severa de ahorros ≥ 70% */
+              WHEN p.saldo_prev > 0
+                   AND ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.70
+                   THEN 'Saldo ahorro cayó ' ||
+                        ROUND(CAST((p.saldo_prev - a.saldo_disponible) / p.saldo_prev * 100 AS NUMERIC), 0)::TEXT ||
+                        '% — pérdida crítica de liquidez'
+
+              /* 4. Caída severa de ahorros 50-70% */
+              WHEN p.saldo_prev > 0
+                   AND ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.50
+                   THEN 'Saldo ahorro cayó ' ||
+                        ROUND(CAST((p.saldo_prev - a.saldo_disponible) / p.saldo_prev * 100 AS NUMERIC), 0)::TEXT ||
+                        '% en las últimas semanas'
+
+              /* 5. Inactividad total + saldo bajo */
+              WHEN tx.num_tx IS NULL AND a.saldo_disponible < 50
+                   THEN 'Sin movimientos + saldo disponible crítico ($' ||
+                        ROUND(a.saldo_disponible::NUMERIC, 2)::TEXT || ')'
+
+              /* 6. Inactividad total */
+              WHEN tx.num_tx IS NULL
+                   THEN 'Sin débitos/créditos en los últimos 60 días'
+
+              /* 7. Muy poca actividad: 1 transacción */
+              WHEN tx.num_tx = 1
+                   THEN 'Solo 1 transacción registrada en los últimos 60 días'
+
+              /* 8. Muy poca actividad: 2 transacciones */
+              WHEN tx.num_tx = 2
+                   THEN 'Solo 2 transacciones en 60 días — actividad mínima'
+
+              /* 9. Mora alta > 30 días */
+              WHEN COALESCE(c.max_dias_mora, 0) > 30
+                   THEN 'Mora de ' || c.max_dias_mora::TEXT || ' días — nivel de riesgo elevado'
+
+              /* 10. Micro-retrasos 1-30 días con calificación A2/A3 */
+              WHEN COALESCE(c.max_dias_mora, 0) BETWEEN 1 AND 30
+                   AND COALESCE(c.cal_score, 0) IN (25, 45)
+                   THEN 'Micro-retrasos: ' || c.max_dias_mora::TEXT || ' días mora — calificación A2/A3'
+
+              /* 11. Calificación B2 o peor */
+              WHEN COALESCE(c.cal_score, 0) >= 85
+                   THEN 'Calificación C1/C2 — alto riesgo regulatorio'
+
+              /* 12. Calificación B2 */
+              WHEN COALESCE(c.cal_score, 0) >= 75
+                   THEN 'Calificación B2 — en zona de riesgo'
+
+              /* 13. Calificación B1 */
+              WHEN COALESCE(c.cal_score, 0) >= 60
+                   THEN 'Calificación B1 — señal temprana de deterioro'
+
+              /* 14. Bloqueo que supera 50% del saldo */
+              WHEN a.monto_bloq > 0 AND a.saldo_disponible > 0
+                   AND a.monto_bloq > a.saldo_disponible * 0.5
+                   THEN 'Bloqueo de $' || ROUND(a.monto_bloq::NUMERIC, 0)::TEXT ||
+                        ' representa más del 50% del saldo disponible'
+
+              /* 15. Bloqueo con mora */
+              WHEN a.monto_bloq > 0 AND COALESCE(c.max_dias_mora, 0) > 0
+                   THEN 'Cuenta bloqueada ($' || ROUND(a.monto_bloq::NUMERIC, 0)::TEXT || ') con mora activa'
+
+              /* 16. Saldo disponible muy bajo */
+              WHEN a.saldo_disponible < 50
+                   THEN 'Saldo disponible crítico: $' || ROUND(a.saldo_disponible::NUMERIC, 2)::TEXT
+
+              /* 17. Caída moderada de ahorros 25-50% */
+              WHEN p.saldo_prev > 0
+                   AND ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.25
+                   THEN 'Tendencia negativa: saldo cayó ' ||
+                        ROUND(CAST((p.saldo_prev - a.saldo_disponible) / p.saldo_prev * 100 AS NUMERIC), 0)::TEXT ||
+                        '% en las últimas semanas'
+
+              /* 18. Egresos superan ingresos marcadamente */
+              WHEN COALESCE(c.ingresos, 0) > 0
+                   AND (COALESCE(c.egresos, 0) / NULLIF(c.ingresos, 0)) > 0.85
+                   THEN 'Egresos representan el ' ||
+                        ROUND(CAST(c.egresos / NULLIF(c.ingresos, 0) * 100 AS NUMERIC), 0)::TEXT ||
+                        '% de sus ingresos declarados'
+
+              /* 19. Relación egresos/ingresos deteriorada */
+              WHEN COALESCE(c.ingresos, 0) > 0
+                   AND (COALESCE(c.egresos, 0) / NULLIF(c.ingresos, 0)) > 0.60
+                   THEN 'Relación egresos/ingresos deteriorada (' ||
+                        ROUND(CAST(c.egresos / NULLIF(c.ingresos, 0) * 100 AS NUMERIC), 0)::TEXT || '%)'
+
+              /* 20. Actividad reducida 3-5 transacciones */
+              WHEN tx.num_tx IS NOT NULL AND tx.num_tx BETWEEN 3 AND 5
+                   THEN 'Actividad muy reducida: ' || tx.num_tx::TEXT || ' movimientos en los últimos 60 días'
+
+              /* 21. Saldo bajo sin señal directa */
+              WHEN a.saldo_disponible < 200
+                   THEN 'Saldo disponible bajo: $' || ROUND(a.saldo_disponible::NUMERIC, 2)::TEXT
+
+              ELSE 'Sin señal crítica identificada'
+            END AS senal_principal
 
           FROM base_ahorro a
           LEFT JOIN prev_base      p  ON a.v_ah_cliente = p.v_ah_cliente
@@ -767,6 +885,7 @@ export class DashboardService {
             d3_ahorro,
             d4_externo,
             d5_deterioro,
+            senal_principal,
             ROUND(CAST(
               (d1_transaccional * 0.20) +
               (d2_crediticio    * 0.35) +
@@ -785,6 +904,7 @@ export class DashboardService {
           d3_ahorro,
           d4_externo,
           d5_deterioro,
+          senal_principal,
           score_global,
           CASE
             WHEN score_global <= 30 THEN 'Bajo'
@@ -919,10 +1039,11 @@ export class DashboardService {
         ];
 
         return {
-          nroCliente:  String(Math.floor(parseFloat(r.v_ah_cliente))),
-          nombre:      r.v_ah_nombre ?? '',
-          scoreGlobal: parseFloat(r.score_global),
-          nivelRiesgo: r.nivel_riesgo,
+          nroCliente:     String(Math.floor(parseFloat(r.v_ah_cliente))),
+          nombre:         r.v_ah_nombre ?? '',
+          scoreGlobal:    parseFloat(r.score_global),
+          nivelRiesgo:    r.nivel_riesgo,
+          senalPrincipal: r.senal_principal ?? 'Sin señal crítica identificada',
           dimensiones,
         };
       });

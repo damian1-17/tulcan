@@ -194,6 +194,9 @@ export class SocioRiesgoDto {
   @ApiProperty({ example: 'Medio', description: 'Nivel de riesgo: Bajo / Medio / Alto / Crítico' })
   nivelRiesgo: string;
 
+  @ApiProperty({ example: 'Saldo ahorro cayó 78% en las últimas semanas', description: 'Señal principal de alerta detectada para el socio' })
+  senalPrincipal: string;
+
   @ApiProperty({ type: [DimensionScoreDto], description: 'Desglose por cada dimensión de riesgo' })
   dimensiones: DimensionScoreDto[];
 }
