@@ -124,11 +124,13 @@ export class DashboardService {
    * Calcula el score de riesgo de morosidad por socio, desglosado en 5 dimensiones.
    *
    * Dimensiones (pesos):
-   *  1. Comportamiento Transaccional (20%) — actividad reciente en transacciones
-   *  2. Perfil Crediticio             (35%) — calificación, días mora, cuotas atrasadas
-   *  3. Estabilidad de Ahorro         (25%) — evolución del saldo Mar→May
-   *  4. Factores Externos             (10%) — cargas familiares, tipo vivienda, capacidad pago
-   *  5. Señales de Deterioro          (10%) — combinación cruzada de señales
+   *  1. Comportamiento Transaccional (15%) — actividad reciente
+   *  2. Estabilidad de Ahorro         (20%) — evolución del saldo
+   *  3. Historial Crediticio          (25%) — calificación, mora, atrasos
+   *  4. Señales de Deterioro          (10%) — combinación de señales
+   *  5. Perfil Socioeconómico         (15%) — capacidad de pago, vivienda
+   *  6. Actividad Económica           (10%) — sector y destino del crédito
+   *  7. Garantías y Patrimonio        (5%)  — cobertura
    *
    * Score 0-30 = Bajo | 31-60 = Medio | 61-80 = Alto | 81-100 = Crítico
    *
@@ -165,8 +167,8 @@ export class DashboardService {
           SELECT fecha_proceso AS fecha
           FROM sabana_ahorro
           GROUP BY fecha_proceso
-          ORDER BY fecha_proceso
-          LIMIT 1
+          ORDER BY fecha_proceso DESC
+          OFFSET 1 LIMIT 1
         ),
         max_credito AS (
           SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito
@@ -602,7 +604,7 @@ export class DashboardService {
         max_ahorro  AS (SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro),
         prev_ahorro AS (
           SELECT fecha_proceso AS fecha FROM sabana_ahorro
-          GROUP BY fecha_proceso ORDER BY fecha_proceso LIMIT 1
+          GROUP BY fecha_proceso ORDER BY fecha_proceso DESC OFFSET 1 LIMIT 1
         ),
         max_credito AS (SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito),
         base_ahorro AS (
@@ -730,7 +732,7 @@ export class DashboardService {
         ),
         resultado AS (
           SELECT ROUND(CAST(
-            (d1*0.15)+(d2*0.20)+(d3*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05)
+            (d1*0.15)+(d3*0.20)+(d2*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05)
           AS NUMERIC),2) AS sg
           FROM scoring
         )
@@ -1038,10 +1040,10 @@ export class DashboardService {
             CASE
               /* 10 días: ya tiene micro-mora activa o señales de deterioro críticas */
               WHEN (max_dias_mora BETWEEN 1 AND 20) AND prob_10d >= 55 THEN '10 días'
-              /* 20 días: sin mora formal pero ahorro cayendo + inactividad */
-              WHEN max_dias_mora = 0 AND d2 >= 62 AND d4 >= 35 AND prob_20d >= 48 THEN '20 días'
+              /* 20 días: mora incipiente o sin mora formal pero ahorro cayendo + inactividad */
+              WHEN max_dias_mora <= 15 AND d2 >= 62 AND d4 >= 35 AND prob_20d >= 48 THEN '20 días'
               /* 30 días: riesgo compuesto moderado sin señales inmediatas */
-              WHEN max_dias_mora = 0 AND sg >= 40 AND prob_30d >= 40 THEN '30 días'
+              WHEN max_dias_mora <= 15 AND sg >= 40 AND prob_30d >= 40 THEN '30 días'
               ELSE NULL
             END AS horizonte,
             -- ─ Factor principal ─
@@ -1179,19 +1181,17 @@ export class DashboardService {
             COALESCE(c.plazo, '')                                             AS plazo,
 
             -- ─ Próxima fecha de pago ─
-            -- Tomamos el último pago (o la concesión) + 1 mes, ajustamos al dia_pago
+            -- Tomamos el mes actual o el próximo basado en el día de pago para evitar fechas pasadas
             (
-              DATE_TRUNC('month',
-                COALESCE(c.fecha_ult_pag, c.fecha_concesion_op, NOW()) + INTERVAL '1 month'
-              ) +
+              DATE_TRUNC('month', NOW()) +
               (LEAST(
                 COALESCE(CAST(NULLIF(c.dia_pago,'') AS INT), 15),
-                DATE_PART('days',
-                  DATE_TRUNC('month',
-                    COALESCE(c.fecha_ult_pag, c.fecha_concesion_op, NOW()) + INTERVAL '2 month'
-                  ) - INTERVAL '1 day'
-                )::INT
-              ) - 1) * INTERVAL '1 day'
+                DATE_PART('days', DATE_TRUNC('month', NOW() + INTERVAL '1 month') - INTERVAL '1 day')::INT
+              ) - 1) * INTERVAL '1 day' +
+              CASE 
+                WHEN EXTRACT(DAY FROM NOW()) > COALESCE(CAST(NULLIF(c.dia_pago,'') AS INT), 15) THEN INTERVAL '1 month'
+                ELSE INTERVAL '0'
+              END
             )::DATE AS fecha_prox_pago,
 
             -- ─ Cuota estimada ─
