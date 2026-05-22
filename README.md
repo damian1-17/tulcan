@@ -1,123 +1,112 @@
-# Security Module
+# MoraCero - Backend
 
-Proyecto backend construido con NestJS para gestión de seguridad, autenticación y autorización en una aplicación.
+Este repositorio contiene el **backend oficial de MoraCero**, construido con NestJS. Está diseñado para gestionar de manera centralizada la seguridad, la autenticación, la autorización y la administración general de la plataforma.
 
-## Descripción
+## 🚀 Características Principales
 
-Este repositorio contiene un módulo de seguridad con:
-- Autenticación JWT
-- Refresh tokens
-- Gestión de usuarios, roles y permisos
-- Recuperación de contraseña por correo
-- Integración con PostgreSQL mediante TypeORM
-- Módulo de códigos QR para asignación y escaneo
-- Migraciones y seeders para inicializar datos
+- **Autenticación Segura:** Implementación de JWT y Refresh tokens.
+- **Control de Accesos:** Gestión robusta de usuarios, roles y permisos.
+- **Gestión de Cuentas:** Sistema de recuperación de contraseñas mediante correo electrónico.
+- **Base de Datos:** Integración avanzada con PostgreSQL a través de TypeORM.
+- **Módulo de Códigos QR:** Generación, asignación y escaneo de códigos QR.
+- **Datos Iniciales:** Migraciones y seeders listos para poblar datos base de manera automática.
 
-## Tecnologías
+## 🛠️ Stack Tecnológico
 
-- Node.js
-- NestJS
-- TypeScript
-- PostgreSQL
-- TypeORM
-- JWT
-- Passport
-- Jest
+- **Entorno de Ejecución:** Node.js (>= 20)
+- **Framework:** NestJS
+- **Lenguaje:** TypeScript
+- **Base de Datos:** PostgreSQL
+- **ORM:** TypeORM
+- **Seguridad:** JWT, Passport
+- **Testing:** Jest
+- **Gestor de Paquetes:** pnpm
 
-## Requisitos
+## 📋 Requisitos Previos
 
-- Node.js >= 20
-- pnpm
-- PostgreSQL
+Asegúrate de tener instalado en tu entorno local:
+- [Node.js](https://nodejs.org/) (versión 20 o superior)
+- [pnpm](https://pnpm.io/) (gestor de paquetes recomendado)
+- [PostgreSQL](https://www.postgresql.org/)
 
-## Instalación
+## ⚙️ Instalación y Configuración
+
+1. **Clonar e instalar dependencias:**
+   ```bash
+   cd app_registro
+   pnpm install
+   ```
+
+2. **Variables de Entorno:**
+   Crea un archivo `.env` en la raíz del proyecto copiando las variables necesarias. Al menos debes configurar lo siguiente:
+
+   ```env
+   SEGURIDAD_DB_HOST=localhost
+   SEGURIDAD_DB_PORT=5432
+   SEGURIDAD_DB_USER=tu_usuario
+   SEGURIDAD_DB_PASS=tu_contraseña
+   SEGURIDAD_DB_NAME=tu_base_de_datos
+   
+   # Opcional: Soporte para conexiones directas del data source de TypeORM
+   SEGURIDAD_DB_DIRECT_HOST=localhost
+   SEGURIDAD_DB_DIRECT_PORT=5432
+   SEGURIDAD_DB_DIRECT_USER=tu_usuario
+   ```
+
+3. **Preparar la Base de Datos:**
+   El proyecto incluye un comando para ejecutar las migraciones y los seeders automáticamente.
+   ```bash
+   pnpm db:setup
+   ```
+   > 💡 `pnpm db:setup` ejecuta las migraciones necesarias y luego inserta los datos iniciales (seeders) de usuarios y roles.
+
+## 💻 Uso y Comandos Disponibles
+
+Para iniciar el servidor, utiliza uno de los siguientes comandos según tu entorno:
 
 ```bash
-cd security_module
-pnpm install
-```
-
-## Variables de entorno
-
-Crea un archivo `.env` en la raíz del proyecto con al menos las siguientes variables:
-
-```bash
-SEGURIDAD_DB_HOST=localhost
-SEGURIDAD_DB_PORT=5432
-SEGURIDAD_DB_USER=tu_usuario
-SEGURIDAD_DB_PASS=tu_contraseña
-SEGURIDAD_DB_NAME=tu_base_de_datos
-```
-
-También se soportan variables directas para el data source de TypeORM:
-
-```bash
-SEGURIDAD_DB_DIRECT_HOST=localhost
-SEGURIDAD_DB_DIRECT_PORT=5432
-SEGURIDAD_DB_DIRECT_USER=tu_usuario
-```
-
-## Comandos disponibles
-
-```bash
-pnpm build
-pnpm start
+# Desarrollo
 pnpm start:dev
+
+# Producción
+pnpm build
 pnpm start:prod
-pnpm test
-pnpm test:watch
-pnpm test:cov
-pnpm test:debug
+
+# Básico
+pnpm start
 ```
 
-## Migraciones y base de datos
+### Comandos de Base de Datos y Migraciones
 
 ```bash
-pnpm migration:create -- <NombreDeLaMigracion>
-pnpm migration:run
-pnpm migration:revert
-pnpm migration:show
-pnpm seed
-pnpm db:setup
+pnpm migration:create -- <NombreDeLaMigracion> # Crear una nueva migración
+pnpm migration:run                             # Ejecutar migraciones pendientes
+pnpm migration:revert                          # Revertir la última migración
+pnpm migration:show                            # Mostrar el estado de las migraciones
+pnpm seed                                      # Ejecutar solo los seeders
 ```
 
-> `pnpm db:setup` ejecuta migraciones y luego corre los seeders.
-
-## Estructura principal
-
-- `src/app.module.ts` - Configuración principal de NestJS
-- `src/database/` - Configuración de TypeORM, migraciones y seeders
-- `src/modules/auth/` - Autenticación, autorizaciones, guards, estrategias, servicios y entidades
-- `src/modules/usuarios/` - Gestión de usuarios
-- `src/modules/roles/` - Gestión de roles
-- `src/modules/qr/` - Funcionalidad de códigos QR
-
-## Configuración de base de datos
-
-El proyecto usa `TypeOrmModule.forRootAsync` en `src/database/database.module.ts` y el archivo de configuración `src/config/seguridadDS.config.ts`.
-
-- Base de datos: PostgreSQL
-- `synchronize`: false
-- `ssl.rejectUnauthorized`: false
-
-## Uso
-
-1. Configura las variables de entorno.
-2. Instala dependencias: `pnpm install`.
-3. Prepara la base de datos: `pnpm db:setup`.
-4. Inicia en modo desarrollo: `pnpm start:dev`.
-
-## Pruebas
+### Pruebas (Testing)
 
 ```bash
-pnpm test
-pnpm test:watch
-pnpm test:cov
+pnpm test          # Ejecutar pruebas unitarias
+pnpm test:watch    # Modo observación
+pnpm test:cov      # Reporte de cobertura
+pnpm test:debug    # Modo depuración
 ```
 
-## Notas
+## 📂 Estructura del Proyecto
 
-- El proyecto está pensado para ejecutarse con `pnpm`.
-- Asegúrate de que PostgreSQL esté accesible desde las variables de entorno configuradas.
-- Las migraciones se encuentran en `src/database/migrations`.
-- Los seeders iniciales de usuarios y roles están en `src/database/seeders`.
+- `src/app.module.ts` - Archivo raíz y configuración principal de NestJS.
+- `src/database/` - Configuración de TypeORM, junto con las migraciones y seeders.
+- `src/modules/auth/` - Lógica de autenticación, guards, estrategias de Passport, servicios y entidades.
+- `src/modules/usuarios/` - Endpoints y lógica de gestión de usuarios.
+- `src/modules/roles/` - Endpoints y lógica de gestión de roles.
+- `src/modules/qr/` - Generación y gestión de funcionalidades QR.
+
+## 📝 Notas Adicionales
+
+- Este proyecto está pensado para gestionarse exclusivamente con **pnpm**.
+- En `src/config/seguridadDS.config.ts` y `src/database/database.module.ts` (con `TypeOrmModule.forRootAsync`) está la configuración principal de la base de datos.
+- Por defecto, la sincronización automática de TypeORM (`synchronize`) está desactivada (`false`) y se confía en las migraciones para estructurar la BD. Además, `ssl.rejectUnauthorized` está en `false`.
+- Asegúrate de que el servicio de PostgreSQL local esté accesible mediante los datos configurados en tu `.env`.
