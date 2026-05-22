@@ -17,6 +17,7 @@ import {
   DelinquencyRiskResponseDto,
   PredictionsResponseDto,
   CuotasRiesgoResponseDto,
+  ConcentracionResponseDto,
 } from './dto/dashboard-response.dto';
 
 @ApiTags('Dashboard')
@@ -125,5 +126,15 @@ export class DashboardController {
       throw new BadRequestException('prioridad debe ser CRÍTICA, ALTA, MEDIA o BAJA');
 
     return this.dashboardService.getCuotasEnRiesgo(pageNum, limitNum, ventanaNum, prioridad);
+  }
+
+  @Get('concentracion')
+  @ApiOperation({
+    summary: 'Concentración de Cartera',
+    description: 'Obtiene las métricas de concentración de cartera por actividad económica, destino del crédito y ciudad de origen, junto con sus respectivos índices de mora.',
+  })
+  @ApiResponse({ status: 200, type: ConcentracionResponseDto })
+  getConcentracionCartera(): Promise<ConcentracionResponseDto> {
+    return this.dashboardService.getConcentracionCartera();
   }
 }

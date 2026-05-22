@@ -15,9 +15,11 @@ import {
   SocioPrediccionDto,
   PredictionResumenDto,
   PredictionsResponseDto,
-  CuotaRiesgoDto,
   CuotasRiesgoResumenDto,
   CuotasRiesgoResponseDto,
+  ConcentracionItemDto,
+  ConcentracionResponseDto,
+  CuotaRiesgoDto,
 } from './dto/dashboard-response.dto';
 
 @Injectable()
@@ -1322,6 +1324,113 @@ export class DashboardService {
       return { resumen, data, page, limit, total };
     } catch (error) {
       this.logger.error('Error en getCuotasEnRiesgo', error);
+      throw error;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Concentración de Cartera (por actividad, destino y ciudad)
+  // ─────────────────────────────────────────────────────────────────────────────
+  async getConcentracionCartera(): Promise<ConcentracionResponseDto> {
+    try {
+      const baseSql = `
+        WITH max_credito AS (
+          SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito
+        ),
+        base AS (
+          SELECT
+            COALESCE(NULLIF(actividad_socio, ''), 'OTRO') AS actividad,
+            COALESCE(NULLIF(destino_op, ''), 'OTRO') AS destino,
+            COALESCE(NULLIF(cidudad_orig, ''), 'OTRO') AS ciudad,
+            COALESCE(saldo_capital, 0) AS saldo_capital,
+            -- Consideramos en mora si días_mora > 0 (o podría ser calificacion no A)
+            CASE WHEN CAST(NULLIF(dias_mora, '') AS FLOAT) > 0 THEN COALESCE(saldo_capital, 0) ELSE 0 END AS saldo_mora
+          FROM sabana_credito
+          WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
+            AND estado_op = 'VIGENTE'
+            AND saldo_capital IS NOT NULL
+            AND saldo_capital > 0
+        ),
+        totales AS (
+          SELECT
+            SUM(saldo_capital) AS cartera_total,
+            SUM(saldo_mora) AS mora_total
+          FROM base
+        ),
+        por_actividad AS (
+          SELECT
+            actividad AS categoria,
+            COUNT(*) AS cantidad,
+            SUM(saldo_capital) AS capital_total,
+            SUM(saldo_mora) AS capital_mora
+          FROM base
+          GROUP BY actividad
+          ORDER BY capital_total DESC
+          LIMIT 10
+        ),
+        por_destino AS (
+          SELECT
+            destino AS categoria,
+            COUNT(*) AS cantidad,
+            SUM(saldo_capital) AS capital_total,
+            SUM(saldo_mora) AS capital_mora
+          FROM base
+          GROUP BY destino
+          ORDER BY capital_total DESC
+          LIMIT 10
+        ),
+        por_ciudad AS (
+          SELECT
+            ciudad AS categoria,
+            COUNT(*) AS cantidad,
+            SUM(saldo_capital) AS capital_total,
+            SUM(saldo_mora) AS capital_mora
+          FROM base
+          GROUP BY ciudad
+          ORDER BY capital_total DESC
+          LIMIT 10
+        )
+        SELECT
+          (SELECT json_build_object('cartera_total', cartera_total, 'mora_total', mora_total) FROM totales) AS totales_globales,
+          (SELECT json_agg(por_actividad.*) FROM por_actividad) AS agg_actividad,
+          (SELECT json_agg(por_destino.*) FROM por_destino) AS agg_destino,
+          (SELECT json_agg(por_ciudad.*) FROM por_ciudad) AS agg_ciudad;
+      `;
+
+      const [res] = await this.sabanaAhorroRepo.query(baseSql);
+
+      const globales = res?.totales_globales || { cartera_total: 0, mora_total: 0 };
+      const carteraTotal = parseFloat(globales.cartera_total || 0);
+      const moraTotal    = parseFloat(globales.mora_total || 0);
+      const indiceGlobal = carteraTotal > 0 ? (moraTotal / carteraTotal) * 100 : 0;
+
+      const mapItems = (arr: any[]) => {
+        if (!arr) return [];
+        return arr.map(item => {
+          const capTotal = parseFloat(item.capital_total || 0);
+          const capMora  = parseFloat(item.capital_mora || 0);
+          return {
+            categoria: item.categoria,
+            cantidadOperaciones: parseInt(item.cantidad || 0, 10),
+            saldoCapitalTotal: capTotal,
+            saldoCapitalMora: capMora,
+            indiceMora: capTotal > 0 ? (capMora / capTotal) * 100 : 0,
+            participacion: carteraTotal > 0 ? (capTotal / carteraTotal) * 100 : 0,
+          };
+        });
+      };
+
+      return {
+        carteraTotal,
+        moraTotal,
+        indiceMoraGlobal: indiceGlobal,
+        porActividad: mapItems(res?.agg_actividad),
+        porDestino: mapItems(res?.agg_destino),
+        porCiudad: mapItems(res?.agg_ciudad),
+      };
+
+    } catch (error) {
+      this.logger.error('Error en getConcentracionCartera', error);
       throw error;
     }
   }

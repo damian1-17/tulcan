@@ -316,3 +316,45 @@ export class CuotasRiesgoResponseDto {
   @ApiProperty({ example: 280 })
   total: number;
 }
+
+// ─── Concentración de Cartera ─────────────────────────────────────────────────
+
+export class ConcentracionItemDto {
+  @ApiProperty({ example: 'Agricultura' })
+  categoria: string;
+
+  @ApiProperty({ example: 150 })
+  cantidadOperaciones: number;
+
+  @ApiProperty({ example: 1500000.50 })
+  saldoCapitalTotal: number;
+
+  @ApiProperty({ example: 45000.00 })
+  saldoCapitalMora: number;
+
+  @ApiProperty({ example: 3.0, description: 'Porcentaje de mora (saldo_mora / saldo_total * 100)' })
+  indiceMora: number;
+
+  @ApiProperty({ example: 25.5, description: 'Participación de esta categoría en el total de la cartera (%)' })
+  participacion: number;
+}
+
+export class ConcentracionResponseDto {
+  @ApiProperty({ example: 5500000.00, description: 'Saldo total de la cartera vigente analizada' })
+  carteraTotal: number;
+
+  @ApiProperty({ example: 220000.00, description: 'Saldo total en mora' })
+  moraTotal: number;
+
+  @ApiProperty({ example: 4.0, description: 'Índice de mora global (%)' })
+  indiceMoraGlobal: number;
+
+  @ApiProperty({ type: [ConcentracionItemDto], description: 'Concentración por actividad económica' })
+  porActividad: ConcentracionItemDto[];
+
+  @ApiProperty({ type: [ConcentracionItemDto], description: 'Concentración por destino del crédito' })
+  porDestino: ConcentracionItemDto[];
+
+  @ApiProperty({ type: [ConcentracionItemDto], description: 'Concentración por ciudad de origen' })
+  porCiudad: ConcentracionItemDto[];
+}
