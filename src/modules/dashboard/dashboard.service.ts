@@ -17,11 +17,8 @@ import {
   PredictionsResponseDto,
   CuotasRiesgoResumenDto,
   CuotasRiesgoResponseDto,
-  ConcentracionItemDto,
   ConcentracionResponseDto,
   CuotaRiesgoDto,
-  RetencionResponseDto,
-  RecuperabilidadResponseDto,
 } from './dto/dashboard-response.dto';
 
 @Injectable()
@@ -121,11 +118,13 @@ export class DashboardService {
    * Calcula el score de riesgo de morosidad por socio, desglosado en 5 dimensiones.
    *
    * Dimensiones (pesos):
-   *  1. Comportamiento Transaccional (20%) — actividad reciente en transacciones
-   *  2. Perfil Crediticio             (35%) — calificación, días mora, cuotas atrasadas
-   *  3. Estabilidad de Ahorro         (25%) — evolución del saldo Mar→May
-   *  4. Factores Externos             (10%) — cargas familiares, tipo vivienda, capacidad pago
-   *  5. Señales de Deterioro          (10%) — combinación cruzada de señales
+   *  1. Comportamiento Transaccional (15%) — actividad reciente
+   *  2. Estabilidad de Ahorro         (20%) — evolución del saldo
+   *  3. Historial Crediticio          (25%) — calificación, mora, atrasos
+   *  4. Señales de Deterioro          (10%) — combinación de señales
+   *  5. Perfil Socioeconómico         (15%) — capacidad de pago, vivienda
+   *  6. Actividad Económica           (10%) — sector y destino del crédito
+   *  7. Garantías y Patrimonio        (5%)  — cobertura
    *
    * Score 0-30 = Bajo | 31-60 = Medio | 61-80 = Alto | 81-100 = Crítico
    *
@@ -162,8 +161,8 @@ export class DashboardService {
           SELECT fecha_proceso AS fecha
           FROM sabana_ahorro
           GROUP BY fecha_proceso
-          ORDER BY fecha_proceso
-          LIMIT 1
+          ORDER BY fecha_proceso DESC
+          OFFSET 1 LIMIT 1
         ),
         max_credito AS (
           SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito
@@ -599,7 +598,7 @@ export class DashboardService {
         max_ahorro  AS (SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro),
         prev_ahorro AS (
           SELECT fecha_proceso AS fecha FROM sabana_ahorro
-          GROUP BY fecha_proceso ORDER BY fecha_proceso LIMIT 1
+          GROUP BY fecha_proceso ORDER BY fecha_proceso DESC OFFSET 1 LIMIT 1
         ),
         max_credito AS (SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito),
         base_ahorro AS (
@@ -727,7 +726,7 @@ export class DashboardService {
         ),
         resultado AS (
           SELECT ROUND(CAST(
-            (d1*0.15)+(d2*0.20)+(d3*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05)
+            (d1*0.15)+(d3*0.20)+(d2*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05)
           AS NUMERIC),2) AS sg
           FROM scoring
         )
@@ -1035,10 +1034,10 @@ export class DashboardService {
             CASE
               /* 10 días: ya tiene micro-mora activa o señales de deterioro críticas */
               WHEN (max_dias_mora BETWEEN 1 AND 20) AND prob_10d >= 55 THEN '10 días'
-              /* 20 días: sin mora formal pero ahorro cayendo + inactividad */
-              WHEN max_dias_mora = 0 AND d2 >= 62 AND d4 >= 35 AND prob_20d >= 48 THEN '20 días'
+              /* 20 días: mora incipiente o sin mora formal pero ahorro cayendo + inactividad */
+              WHEN max_dias_mora <= 15 AND d2 >= 62 AND d4 >= 35 AND prob_20d >= 48 THEN '20 días'
               /* 30 días: riesgo compuesto moderado sin señales inmediatas */
-              WHEN max_dias_mora = 0 AND sg >= 40 AND prob_30d >= 40 THEN '30 días'
+              WHEN max_dias_mora <= 15 AND sg >= 40 AND prob_30d >= 40 THEN '30 días'
               ELSE NULL
             END AS horizonte,
             -- ─ Factor principal ─
@@ -1176,19 +1175,17 @@ export class DashboardService {
             COALESCE(c.plazo, '')                                             AS plazo,
 
             -- ─ Próxima fecha de pago ─
-            -- Tomamos el último pago (o la concesión) + 1 mes, ajustamos al dia_pago
+            -- Tomamos el mes actual o el próximo basado en el día de pago para evitar fechas pasadas
             (
-              DATE_TRUNC('month',
-                COALESCE(c.fecha_ult_pag, c.fecha_concesion_op, NOW()) + INTERVAL '1 month'
-              ) +
+              DATE_TRUNC('month', NOW()) +
               (LEAST(
                 COALESCE(CAST(NULLIF(c.dia_pago,'') AS INT), 15),
-                DATE_PART('days',
-                  DATE_TRUNC('month',
-                    COALESCE(c.fecha_ult_pag, c.fecha_concesion_op, NOW()) + INTERVAL '2 month'
-                  ) - INTERVAL '1 day'
-                )::INT
-              ) - 1) * INTERVAL '1 day'
+                DATE_PART('days', DATE_TRUNC('month', NOW() + INTERVAL '1 month') - INTERVAL '1 day')::INT
+              ) - 1) * INTERVAL '1 day' +
+              CASE 
+                WHEN EXTRACT(DAY FROM NOW()) > COALESCE(CAST(NULLIF(c.dia_pago,'') AS INT), 15) THEN INTERVAL '1 month'
+                ELSE INTERVAL '0'
+              END
             )::DATE AS fecha_prox_pago,
 
             -- ─ Cuota estimada ─
@@ -1433,207 +1430,6 @@ export class DashboardService {
 
     } catch (error) {
       this.logger.error('Error en getConcentracionCartera', error);
-      throw error;
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Retención de Socios (Riesgo de Fuga)
-  // ─────────────────────────────────────────────────────────────────────────────
-  async getRetencionSocios(page: number, limit: number, riesgo?: string): Promise<RetencionResponseDto> {
-    try {
-      const offset = (page - 1) * limit;
-
-      const baseSql = `
-        WITH max_ahorro AS (
-          SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro
-        ),
-        base_ahorro AS (
-          SELECT
-            CAST(v_ah_cliente AS TEXT) AS nro_cliente,
-            v_ah_nombre AS nombres_socio,
-            CAST(saldo_disponible AS FLOAT) AS saldo_ahorro,
-            COALESCE(CAST(EXTRACT(DAY FROM (NOW() - fecha_ultmov)) AS INT), 0) AS dias_inactividad,
-            fecha_ultmov AS fecha_ult_movimiento
-          FROM sabana_ahorro
-          WHERE fecha_proceso = (SELECT fecha FROM max_ahorro)
-        ),
-        base_credito AS (
-          SELECT DISTINCT nro_cliente FROM sabana_credito WHERE estado_op = 'VIGENTE'
-        ),
-        resultado AS (
-          SELECT
-            a.nro_cliente,
-            a.nombres_socio,
-            a.saldo_ahorro,
-            a.dias_inactividad,
-            a.fecha_ult_movimiento,
-            CASE WHEN c.nro_cliente IS NOT NULL THEN true ELSE false END AS tiene_credito,
-            false AS tiene_cooplinea,
-            LEAST(100, CAST(a.dias_inactividad AS FLOAT) * 0.5) AS probabilidad_fuga,
-            CASE
-              WHEN a.dias_inactividad > 90 THEN 'Alto'
-              WHEN a.dias_inactividad > 30 THEN 'Medio'
-              ELSE 'Bajo'
-            END AS nivel_riesgo,
-            'Inactividad prolongada' AS motivo_principal
-          FROM base_ahorro a
-          LEFT JOIN base_credito c ON a.nro_cliente = c.nro_cliente
-        )
-      `;
-
-      let filtro = '';
-      if (riesgo) {
-        filtro = `WHERE nivel_riesgo = '${riesgo}'`;
-      }
-
-      const sql = `
-        ${baseSql}
-        SELECT * FROM resultado
-        ${filtro}
-        ORDER BY probabilidad_fuga DESC
-        LIMIT $1 OFFSET $2;
-      `;
-
-      const sqlResumen = `
-        ${baseSql}
-        SELECT
-          COUNT(*) FILTER (WHERE nivel_riesgo = 'Alto') AS total_riesgo_alto,
-          COUNT(*) FILTER (WHERE nivel_riesgo = 'Medio') AS total_riesgo_medio,
-          SUM(saldo_ahorro) FILTER (WHERE nivel_riesgo IN ('Alto', 'Medio')) AS saldo_en_riesgo,
-          COUNT(*) AS total
-        FROM resultado
-        ${filtro};
-      `;
-
-      const [rows, [res]] = await Promise.all([
-        this.sabanaAhorroRepo.query(sql, [limit, offset]),
-        this.sabanaAhorroRepo.query(sqlResumen),
-      ]);
-
-      const data = rows.map((r: any) => ({
-        nroCliente: String(r.nro_cliente),
-        nombresSocio: r.nombres_socio,
-        saldoAhorro: parseFloat(r.saldo_ahorro || 0),
-        diasInactividad: parseInt(r.dias_inactividad || 0, 10),
-        fechaUltMovimiento: r.fecha_ult_movimiento ? String(r.fecha_ult_movimiento) : null,
-        tieneCredito: r.tiene_credito,
-        tieneCooplinea: r.tiene_cooplinea,
-        probabilidadFuga: parseFloat(r.probabilidad_fuga || 0),
-        nivelRiesgo: r.nivel_riesgo,
-        motivoPrincipal: r.motivo_principal,
-      }));
-
-      const resumen = {
-        totalRiesgoAlto: parseInt(res?.total_riesgo_alto || '0', 10),
-        totalRiesgoMedio: parseInt(res?.total_riesgo_medio || '0', 10),
-        saldoEnRiesgo: parseFloat(res?.saldo_en_riesgo || '0'),
-      };
-
-      const total = parseInt(res?.total || '0', 10);
-
-      return { resumen, data, page, limit, total };
-    } catch (error) {
-      this.logger.error('Error en getRetencionSocios', error);
-      throw error;
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Recuperabilidad de Cartera Vencida
-  // ─────────────────────────────────────────────────────────────────────────────
-  async getRecuperabilidadCartera(page: number, limit: number, segmento?: string): Promise<RecuperabilidadResponseDto> {
-    try {
-      const offset = (page - 1) * limit;
-
-      const baseSql = `
-        WITH base AS (
-          SELECT
-            nro_cliente,
-            nombres_socio,
-            nro_operacion,
-            CAST(NULLIF(dias_mora, '') AS INT) AS dias_mora,
-            CAST(saldo_capital AS FLOAT) AS saldo_vencido,
-            -- Mock de datos no disponibles
-            'Hipotecaria' AS tipo_garantia,
-            1000 AS ingresos
-          FROM sabana_credito
-          WHERE estado_op = 'VIGENTE'
-            AND CAST(NULLIF(dias_mora, '') AS FLOAT) > 0
-        ),
-        resultado AS (
-          SELECT
-            *,
-            CASE
-              WHEN dias_mora < 30 THEN 'Alta'
-              WHEN dias_mora < 90 THEN 'Media'
-              ELSE 'Baja'
-            END AS segmento,
-            100 - LEAST(90, dias_mora * 0.5) AS score_recuperacion,
-            'Garantía real' AS factor_positivo
-          FROM base
-        )
-      `;
-
-      let filtro = '';
-      if (segmento) {
-        filtro = `WHERE segmento = '${segmento}'`;
-      }
-
-      const sql = `
-        ${baseSql}
-        SELECT * FROM resultado
-        ${filtro}
-        ORDER BY score_recuperacion DESC
-        LIMIT $1 OFFSET $2;
-      `;
-
-      const sqlResumen = `
-        ${baseSql}
-        SELECT
-          COUNT(*) FILTER (WHERE segmento = 'Alta') AS total_alta,
-          COUNT(*) FILTER (WHERE segmento = 'Media') AS total_media,
-          COUNT(*) FILTER (WHERE segmento = 'Baja') AS total_baja,
-          COALESCE(SUM(saldo_vencido) FILTER (WHERE segmento = 'Alta'), 0) AS monto_alta,
-          COALESCE(SUM(saldo_vencido) FILTER (WHERE segmento = 'Media'), 0) AS monto_media,
-          COALESCE(SUM(saldo_vencido) FILTER (WHERE segmento = 'Baja'), 0) AS monto_baja,
-          COUNT(*) AS total
-        FROM resultado
-        ${filtro};
-      `;
-
-      const [rows, [res]] = await Promise.all([
-        this.sabanaCreditoRepo.query(sql, [limit, offset]),
-        this.sabanaCreditoRepo.query(sqlResumen),
-      ]);
-
-      const data = rows.map((r: any) => ({
-        nroCliente: String(r.nro_cliente),
-        nombresSocio: r.nombres_socio,
-        nroOperacion: r.nro_operacion,
-        diasMora: parseInt(r.dias_mora || 0, 10),
-        saldoVencido: parseFloat(r.saldo_vencido || 0),
-        tipoGarantia: r.tipo_garantia,
-        segmento: r.segmento,
-        scoreRecuperacion: parseFloat(r.score_recuperacion || 0),
-        factorPositivo: r.factor_positivo,
-        ingresos: parseFloat(r.ingresos || 0),
-      }));
-
-      const resumen = {
-        totalAlta: parseInt(res?.total_alta || '0', 10),
-        totalMedia: parseInt(res?.total_media || '0', 10),
-        totalBaja: parseInt(res?.total_baja || '0', 10),
-        montoAlta: parseFloat(res?.monto_alta || '0'),
-        montoMedia: parseFloat(res?.monto_media || '0'),
-        montoBaja: parseFloat(res?.monto_baja || '0'),
-      };
-
-      const total = parseInt(res?.total || '0', 10);
-
-      return { resumen, data, page, limit, total };
-    } catch (error) {
-      this.logger.error('Error en getRecuperabilidadCartera', error);
       throw error;
     }
   }
