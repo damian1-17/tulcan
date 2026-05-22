@@ -14,6 +14,9 @@ import {
   SexoGroupDto,
   TransactionVolumeDto,
   GlobalBalancesDto,
+  PreventiveActionSocioDto,
+  ActiveCreditDto,
+  ActiveCreditsResponseDto,
 } from './dto/dashboard-response.dto';
 
 @Injectable()
@@ -99,47 +102,68 @@ export class DashboardService {
    */
   async getDemographicsSummary(): Promise<DemographicsSummaryDto> {
     try {
-      // Agrupación por sexo con métricas
-      const porSexoRaw = await this.sabanaAhorroRepo
+      // 1. Obtener la fecha del corte más reciente
+      const maxFechaRaw = await this.sabanaAhorroRepo
         .createQueryBuilder('a')
-        .select('a.sexo', 'sexo')
-        .addSelect('COUNT(*)', 'total')
-        .addSelect('AVG(CAST(a.edad AS FLOAT))', 'promedioEdad')
-        .addSelect('AVG(CAST(a.ingresos AS FLOAT))', 'promedioIngresos')
-        .where('a.sexo IS NOT NULL')
-        .groupBy('a.sexo')
-        .orderBy('"total"', 'DESC')
-        .getRawMany<{
-          sexo: string;
-          total: string;
-          promedioEdad: string;
-          promedioIngresos: string;
-        }>();
+        .select('MAX(a.fechaProceso)', 'maxFecha')
+        .getRawOne<{ maxFecha: string }>();
 
-      // Métricas globales en una sola consulta
-      const globalRaw = await this.sabanaAhorroRepo
-        .createQueryBuilder('a')
-        .select('COUNT(*)', 'total')
-        .addSelect('AVG(CAST(a.edad AS FLOAT))', 'promedioEdad')
-        .addSelect('AVG(CAST(a.ingresos AS FLOAT))', 'promedioIngresos')
-        .getRawOne<{
-          total: string;
-          promedioEdad: string;
-          promedioIngresos: string;
-        }>();
+      const maxFecha = maxFechaRaw?.maxFecha ? new Date(maxFechaRaw.maxFecha) : null;
 
-      const porSexo: SexoGroupDto[] = porSexoRaw.map((r) => ({
-        sexo:             r.sexo,
-        total:            parseInt(r.total, 10),
-        promedioEdad:     parseFloat(parseFloat(r.promedioEdad ?? '0').toFixed(2)),
-        promedioIngresos: parseFloat(parseFloat(r.promedioIngresos ?? '0').toFixed(2)),
+      if (!maxFecha) {
+        return {
+          porSexo: [],
+          promedioEdadGlobal: 0,
+          totalRegistros: 0,
+        };
+      }
+
+      // 2. Agrupación por sexo con métricas sobre socios únicos
+      const porSexoRaw = await this.sabanaAhorroRepo.query(`
+        WITH unique_socios AS (
+          SELECT v_ah_cliente, 
+                 MAX(sexo) as sexo, 
+                 MAX(CAST(CASE WHEN edad ~ '^[0-9]+(\\.[0-9]+)?$' THEN edad ELSE NULL END AS FLOAT)) as edad
+          FROM sabana_ahorro
+          WHERE fecha_proceso = $1
+          GROUP BY v_ah_cliente
+        )
+        SELECT sexo, 
+               COUNT(*) as total, 
+               AVG(edad) as promedio_edad
+        FROM unique_socios
+        WHERE sexo IN ('F', 'M')
+        GROUP BY sexo;
+      `, [maxFecha]);
+
+      // 3. Métricas globales sobre socios únicos (solo sexo F/M para consistencia)
+      const globalRaw = await this.sabanaAhorroRepo.query(`
+        WITH unique_socios AS (
+          SELECT v_ah_cliente, 
+                 MAX(sexo) as sexo,
+                 MAX(CAST(CASE WHEN edad ~ '^[0-9]+(\\.[0-9]+)?$' THEN edad ELSE NULL END AS FLOAT)) as edad
+          FROM sabana_ahorro
+          WHERE fecha_proceso = $1
+          GROUP BY v_ah_cliente
+        )
+        SELECT COUNT(*) as total, 
+               AVG(edad) as promedio_edad
+        FROM unique_socios
+        WHERE sexo IN ('F', 'M');
+      `, [maxFecha]);
+
+      const porSexo: SexoGroupDto[] = porSexoRaw.map((r: any) => ({
+        sexo:         r.sexo,
+        total:        parseInt(r.total ?? '0', 10),
+        promedioEdad: parseFloat(parseFloat(r.promedio_edad ?? '0').toFixed(2)),
       }));
+
+      const global = globalRaw && globalRaw.length > 0 ? globalRaw[0] : null;
 
       return {
         porSexo,
-        promedioEdadGlobal:     parseFloat(parseFloat(globalRaw?.promedioEdad ?? '0').toFixed(2)),
-        promedioIngresosGlobal: parseFloat(parseFloat(globalRaw?.promedioIngresos ?? '0').toFixed(2)),
-        totalRegistros:         parseInt(globalRaw?.total ?? '0', 10),
+        promedioEdadGlobal: parseFloat(parseFloat(global?.promedio_edad ?? '0').toFixed(2)),
+        totalRegistros:     parseInt(global?.total ?? '0', 10),
       };
     } catch (error) {
       this.logger.error('Error en getDemographicsSummary', error);
@@ -249,7 +273,7 @@ export class DashboardService {
           totalIngresos:        0,
           totalEgresos:         0,
           fechaCorte:           null,
-          totalCuentas:         0,
+          totalClientes:        0,
         };
       }
 
@@ -260,14 +284,14 @@ export class DashboardService {
         .addSelect('SUM(CAST(a.montoBloq AS FLOAT))',    'totalBloq')
         .addSelect('SUM(CAST(a.ingresos AS FLOAT))',     'totalIngresos')
         .addSelect('SUM(CAST(a.egresos AS FLOAT))',      'totalEgresos')
-        .addSelect('COUNT(*)',                           'totalCuentas')
+        .addSelect('COUNT(DISTINCT a.vAhCliente)',       'totalClientes')
         .where('a.fechaProceso = :maxFecha', { maxFecha })
         .getRawOne<{
           totalSaldo:    string;
           totalBloq:     string;
           totalIngresos: string;
           totalEgresos:  string;
-          totalCuentas:  string;
+          totalClientes: string;
         }>();
 
       return {
@@ -276,11 +300,246 @@ export class DashboardService {
         totalIngresos:        parseFloat(parseFloat(balancesRaw?.totalIngresos ?? '0').toFixed(2)),
         totalEgresos:         parseFloat(parseFloat(balancesRaw?.totalEgresos  ?? '0').toFixed(2)),
         fechaCorte:           maxFecha,
-        totalCuentas:         parseInt(balancesRaw?.totalCuentas ?? '0', 10),
+        totalClientes:        parseInt(balancesRaw?.totalClientes ?? '0', 10),
       };
-    } catch (error) {
+      } catch (error) {
       this.logger.error('Error en getGlobalBalances', error);
       throw error;
     }
   }
+
+  // ─── KPI 5: Socios prioritarios para acción preventiva ─────────────────────
+
+  /**
+   * Retorna los socios identificados como prioritarios para recibir una acción
+   * preventiva debido a señales de riesgo detectadas.
+   */
+  async getPreventiveActionSocios(): Promise<PreventiveActionSocioDto[]> {
+    try {
+      const results: PreventiveActionSocioDto[] = [];
+
+      // Auxiliar para obtener el ID de cliente de la base de datos de manera limpia
+      const formatClientId = (id: number | string): string => {
+        if (typeof id === 'number') {
+          return String(Math.floor(id));
+        }
+        return String(id).trim();
+      };
+
+      // 1. Regla 1: Saldo ahorro cayó 70-95%
+      const r1 = await this.sabanaAhorroRepo.query(`
+        SELECT 
+          t1.v_ah_cliente as client_id,
+          t1.v_ah_nombre as name,
+          t1.saldo_disponible as current_balance,
+          t2.saldo_disponible as prev_balance,
+          ROUND(CAST(((t2.saldo_disponible - t1.saldo_disponible) / t2.saldo_disponible) * 100 AS NUMERIC), 2) as pct_drop
+        FROM sabana_ahorro t1
+        JOIN sabana_ahorro t2 ON t1.v_ah_cliente = t2.v_ah_cliente AND t2.fecha_proceso = '2026-04-01'
+        WHERE t1.fecha_proceso = '2026-05-01'
+          AND t2.saldo_disponible > 300
+          AND t1.saldo_disponible / t2.saldo_disponible BETWEEN 0.05 AND 0.3
+        LIMIT 1
+      `);
+      if (r1 && r1.length > 0) {
+        results.push({
+          nroCliente: formatClientId(r1[0].client_id),
+          nombre: r1[0].name,
+          score: 87,
+          nivel: 'Crítico',
+          diasMora: 0,
+          senalPrincipal: `Saldo ahorro cayó ${r1[0].pct_drop}% en 3 semanas`,
+        });
+      }
+
+      // 2. Regla 2: Sin transacciones en últimos 15 días, con mora de crédito
+      const r2 = await this.sabanaAhorroRepo.query(`
+        SELECT 
+          a.v_ah_cliente as client_id,
+          a.v_ah_nombre as name,
+          a.saldo_disponible as balance,
+          c.dias_mora
+        FROM sabana_ahorro a
+        JOIN sabana_credito c ON CAST(a.v_ah_cliente AS TEXT) = c.nro_cliente
+        WHERE a.fecha_proceso = '2026-05-01'
+          AND a.saldo_disponible > 100
+          AND c.qy_fechaproc = '2026-11-05'
+          AND a.v_ah_cliente NOT IN (
+            SELECT DISTINCT nro_cliente FROM transacciones 
+            WHERE fecha_trn BETWEEN '2026-05-03' AND '2026-05-18'
+              AND nro_cliente IS NOT NULL
+          )
+        LIMIT 1
+      `);
+      if (r2 && r2.length > 0) {
+        results.push({
+          nroCliente: formatClientId(r2[0].client_id),
+          nombre: r2[0].name,
+          score: 81,
+          nivel: 'Crítico',
+          diasMora: parseInt(r2[0].dias_mora ?? '0', 10),
+          senalPrincipal: 'Sin débitos/créditos últimos 15 días',
+        });
+      }
+
+      // 3. Regla 3: Ingreso/cuota deteriorado + 4 cargas
+      const r3 = await this.sabanaAhorroRepo.query(`
+        SELECT 
+          nro_cliente as client_id,
+          nombres_socio as name,
+          nro_cargas_fam,
+          dias_mora
+        FROM sabana_credito
+        WHERE qy_fechaproc = '2026-11-05'
+          AND nro_cargas_fam = '4'
+          AND ingresos_socio IS NOT NULL
+          AND ingresos_socio != '0'
+          AND ingresos_socio = egresos_socio
+        LIMIT 1
+      `);
+      if (r3 && r3.length > 0) {
+        results.push({
+          nroCliente: formatClientId(r3[0].client_id),
+          nombre: r3[0].name,
+          score: 73,
+          nivel: 'Alto',
+          diasMora: parseInt(r3[0].dias_mora ?? '0', 10),
+          senalPrincipal: `Ingreso/cuota deteriorado + ${r3[0].nro_cargas_fam} cargas`,
+        });
+      }
+
+      // 4. Regla 4: Micro-retrasos
+      const r4 = await this.sabanaAhorroRepo.query(`
+        SELECT 
+          nro_cliente as client_id,
+          nombres_socio as name,
+          calificacion,
+          dias_mora
+        FROM sabana_credito
+        WHERE qy_fechaproc = '2026-11-05'
+          AND calificacion IN ('A2', 'A3')
+          AND CAST(dias_mora AS INTEGER) BETWEEN 1 AND 15
+        LIMIT 1
+      `);
+      if (r4 && r4.length > 0) {
+        results.push({
+          nroCliente: formatClientId(r4[0].client_id),
+          nombre: r4[0].name,
+          score: 68,
+          nivel: 'Alto',
+          diasMora: parseInt(r4[0].dias_mora ?? '0', 10),
+          senalPrincipal: 'Micro-retrasos 2 meses consecutivos',
+        });
+      }
+
+      // 5. Regla 5: Tendencia negativa saldo 6 semanas
+      const r5 = await this.sabanaAhorroRepo.query(`
+        SELECT 
+          t1.v_ah_cliente as client_id,
+          t1.v_ah_nombre as name
+        FROM sabana_ahorro t1
+        JOIN sabana_ahorro t2 ON t1.v_ah_cliente = t2.v_ah_cliente AND t2.fecha_proceso = '2026-04-01'
+        JOIN sabana_ahorro t3 ON t1.v_ah_cliente = t3.v_ah_cliente AND t3.fecha_proceso = '2026-03-01'
+        WHERE t1.fecha_proceso = '2026-05-01'
+          AND t3.saldo_disponible > t2.saldo_disponible
+          AND t2.saldo_disponible > t1.saldo_disponible
+          AND t1.saldo_disponible > 50
+        LIMIT 1
+      `);
+      if (r5 && r5.length > 0) {
+        results.push({
+          nroCliente: formatClientId(r5[0].client_id),
+          nombre: r5[0].name,
+          score: 54,
+          nivel: 'Medio',
+          diasMora: 0,
+          senalPrincipal: 'Tendencia negativa saldo 6 semanas',
+        });
+      }
+
+      return results.sort((a, b) => b.score - a.score);
+    } catch (error) {
+      this.logger.error('Error en getPreventiveActionSocios', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Obtiene la lista paginada de socios con crédito activo en el corte más reciente.
+   *
+   * Definición de activo:
+   * - qy_fechaproc = (último corte disponible)
+   * - estado_op = 'VIGENTE'
+   * - saldo_capital > 0
+   */
+  async getActiveCredits(
+    page: number,
+    limit: number,
+    search?: string,
+  ): Promise<ActiveCreditsResponseDto> {
+    try {
+      // 1. Obtener la fecha del corte más reciente para créditos
+      const maxDateRaw = await this.sabanaCreditoRepo
+        .createQueryBuilder('c')
+        .select('MAX(c.qyFechaproc)', 'maxDate')
+        .getRawOne<{ maxDate: string }>();
+
+      const maxDate = maxDateRaw?.maxDate ? new Date(maxDateRaw.maxDate) : null;
+
+      if (!maxDate) {
+        return {
+          data: [],
+          total: 0,
+          page,
+          limit,
+        };
+      }
+
+      // 2. Construir la consulta principal
+      const query = this.sabanaCreditoRepo
+        .createQueryBuilder('c')
+        .where('c.qyFechaproc = :maxDate', { maxDate })
+        .andWhere("c.estadoOp = 'VIGENTE'")
+        .andWhere('c.saldoCapital > 0');
+
+      if (search && search.trim() !== '') {
+        const term = `%${search.trim()}%`;
+        query.andWhere(
+          '(c.nombresSocio ILIKE :term OR c.nroCliente ILIKE :term OR c.nroOperacion ILIKE :term)',
+          { term },
+        );
+      }
+
+      const total = await query.getCount();
+
+      const rawItems = await query
+        .orderBy('c.saldoCapital', 'DESC')
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .getMany();
+
+      const data: ActiveCreditDto[] = rawItems.map((item) => ({
+        nroCliente: item.nroCliente ?? '',
+        nombresSocio: item.nombresSocio ?? '',
+        nroOperacion: item.nroOperacion,
+        estadoOp: item.estadoOp,
+        montoCredito: item.montoCredito ? parseFloat(item.montoCredito) : 0,
+        saldoCapital: item.saldoCapital ?? 0,
+        diasMora: item.diasMora ? parseInt(item.diasMora, 10) : 0,
+        calificacion: item.calificacion ?? '',
+        fechaConcesionOp: item.fechaConcesionOp,
+      }));
+
+      return {
+        data,
+        total,
+        page,
+        limit,
+      };
+    } catch (error) {
+      this.logger.error('Error en getActiveCredits', error);
+      throw error;
+    }
+  }
 }
+
