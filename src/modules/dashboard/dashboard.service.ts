@@ -17,9 +17,14 @@ import {
   PredictionsResponseDto,
   CuotasRiesgoResumenDto,
   CuotasRiesgoResponseDto,
-  ConcentracionItemDto,
   ConcentracionResponseDto,
   CuotaRiesgoDto,
+  SocioRetencionDto,
+  RetencionResumenDto,
+  RetencionResponseDto,
+  SocioRecuperableDto,
+  RecuperabilidadResumenDto,
+  RecuperabilidadResponseDto,
 } from './dto/dashboard-response.dto';
 
 @Injectable()
@@ -1431,6 +1436,321 @@ export class DashboardService {
 
     } catch (error) {
       this.logger.error('Error en getConcentracionCartera', error);
+      throw error;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Retención de Socios (Riesgo de Fuga y Liquidez)
+  // ─────────────────────────────────────────────────────────────────────────────
+  async getRetencionSocios(
+    page:  number,
+    limit: number,
+    riesgo?: string, // 'Alto' | 'Medio' | 'Bajo'
+  ): Promise<RetencionResponseDto> {
+    try {
+      const offset = (page - 1) * limit;
+      const riesgoFilter = riesgo ? `AND nivel_riesgo = '${riesgo}'` : '';
+
+      // Usamos sabana_ahorro como base para retención
+      const baseSql = `
+        WITH max_ahorro AS (
+          SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro
+        ),
+        socios_base AS (
+          SELECT
+            a.v_ah_cliente::TEXT AS nro_cliente,
+            COALESCE(a.v_ah_nombre, '') AS nombres_socio,
+            COALESCE(a.saldo_disponible, 0) AS saldo_ahorro,
+            a.fecha_ultmov,
+            COALESCE(a.credito, 'NO') AS credito,
+            COALESCE(a.cooplinea, 'NO') AS cooplinea,
+
+            -- Cálculo de inactividad
+            COALESCE(
+              DATE_PART('days', NOW() - COALESCE(a.fecha_ultmov, a.fecha_aper, NOW())),
+              0
+            )::INT AS dias_inactividad
+
+          FROM sabana_ahorro a
+          WHERE a.fecha_proceso = (SELECT fecha FROM max_ahorro)
+            -- Excluimos saldos negativos (sobregiros)
+            AND COALESCE(a.saldo_disponible, 0) >= 0
+            -- Solo consideramos clientes con cuenta principal (ahorro a la vista / libre disponibilidad)
+            AND a.estado_cta = 'A'
+            -- Agrupamos por cliente para evitar duplicados si tienen múltiples cuentas
+            -- Nos quedamos con la cuenta de mayor saldo
+        ),
+        socios_agrupados AS (
+          SELECT DISTINCT ON (nro_cliente)
+            *
+          FROM socios_base
+          ORDER BY nro_cliente, saldo_ahorro DESC
+        ),
+        scoring AS (
+          SELECT
+            *,
+            -- Puntos por inactividad
+            CASE
+              WHEN dias_inactividad > 180 THEN 40
+              WHEN dias_inactividad > 90  THEN 25
+              WHEN dias_inactividad > 30  THEN 10
+              ELSE 0
+            END +
+            -- Puntos por falta de vinculación cruzada
+            CASE WHEN UPPER(credito) IN ('NO', 'N', '0', '') THEN 30 ELSE 0 END +
+            -- Puntos por bajo saldo (indica vaciado de cuenta)
+            CASE
+              WHEN saldo_ahorro < 5   THEN 20
+              WHEN saldo_ahorro < 50  THEN 10
+              ELSE 0
+            END +
+            -- Puntos por falta de canales digitales
+            CASE WHEN UPPER(cooplinea) IN ('NO', 'N', '0', '') THEN 10 ELSE 0 END
+            AS prob_base
+          FROM socios_agrupados
+        ),
+        resultado AS (
+          SELECT
+            nro_cliente,
+            nombres_socio,
+            saldo_ahorro,
+            dias_inactividad,
+            fecha_ultmov::TEXT AS fecha_ultmov,
+            UPPER(credito) NOT IN ('NO', 'N', '0', '') AS tiene_credito,
+            UPPER(cooplinea) NOT IN ('NO', 'N', '0', '') AS tiene_cooplinea,
+            
+            -- Normalizamos probabilidad al 100%
+            LEAST(prob_base, 100) AS probabilidad_fuga,
+
+            -- Nivel de Riesgo
+            CASE
+              WHEN prob_base >= 70 THEN 'Alto'
+              WHEN prob_base >= 40 THEN 'Medio'
+              ELSE 'Bajo'
+            END AS nivel_riesgo,
+
+            -- Determinación del motivo principal
+            CASE
+              WHEN prob_base >= 70 AND saldo_ahorro < 10 THEN 'Cuenta vaciada y sin obligaciones cruzadas'
+              WHEN prob_base >= 70 AND dias_inactividad > 180 THEN 'Inactividad prolongada (>6 meses)'
+              WHEN prob_base >= 40 AND UPPER(credito) IN ('NO', 'N', '0', '') THEN 'Baja transaccionalidad y sin crédito activo'
+              ELSE 'Factores combinados moderados'
+            END AS motivo_principal
+
+          FROM scoring
+          -- Filtramos a los que tienen al menos riesgo Medio para no saturar la tabla con socios sanos
+          WHERE prob_base >= 40
+        )
+      `;
+
+      const sqlQuery = `
+        ${baseSql}
+        SELECT *
+        FROM resultado
+        WHERE 1=1 ${riesgoFilter}
+        ORDER BY probabilidad_fuga DESC, saldo_ahorro DESC
+        LIMIT $1 OFFSET $2;
+      `;
+
+      const sqlResumen = `
+        ${baseSql}
+        SELECT
+          COUNT(*) FILTER (WHERE nivel_riesgo = 'Alto') AS total_alto,
+          COUNT(*) FILTER (WHERE nivel_riesgo = 'Medio') AS total_medio,
+          COALESCE(SUM(saldo_ahorro), 0) AS saldo_riesgo
+        FROM resultado;
+      `;
+
+      const [rows, [res]] = await Promise.all([
+        this.sabanaAhorroRepo.query(sqlQuery, [limit, offset]),
+        this.sabanaAhorroRepo.query(sqlResumen),
+      ]);
+
+      const resumen: RetencionResumenDto = {
+        totalRiesgoAlto:  parseInt(res?.total_alto ?? '0', 10),
+        totalRiesgoMedio: parseInt(res?.total_medio ?? '0', 10),
+        saldoEnRiesgo:    parseFloat(parseFloat(res?.saldo_riesgo ?? '0').toFixed(2)),
+      };
+
+      const data: SocioRetencionDto[] = rows.map((r: any) => ({
+        nroCliente:         r.nro_cliente ?? '',
+        nombresSocio:       r.nombres_socio ?? '',
+        saldoAhorro:        parseFloat(parseFloat(r.saldo_ahorro ?? '0').toFixed(2)),
+        diasInactividad:    parseInt(r.dias_inactividad ?? '0', 10),
+        fechaUltMovimiento: r.fecha_ultmov ?? null,
+        tieneCredito:       Boolean(r.tiene_credito),
+        tieneCooplinea:     Boolean(r.tiene_cooplinea),
+        probabilidadFuga:   parseInt(r.probabilidad_fuga ?? '0', 10),
+        nivelRiesgo:        r.nivel_riesgo ?? 'Bajo',
+        motivoPrincipal:    r.motivo_principal ?? '',
+      }));
+
+      const total = riesgo === 'Alto'  ? resumen.totalRiesgoAlto
+                  : riesgo === 'Medio' ? resumen.totalRiesgoMedio
+                  : resumen.totalRiesgoAlto + resumen.totalRiesgoMedio;
+
+      return { resumen, data, page, limit, total };
+
+    } catch (error) {
+      this.logger.error('Error en getRetencionSocios', error);
+      throw error;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Recuperabilidad de Cartera Vencida
+  // ─────────────────────────────────────────────────────────────────────────────
+  async getRecuperabilidadCartera(
+    page:  number,
+    limit: number,
+    segmento?: string, // 'Alta' | 'Media' | 'Baja'
+  ): Promise<RecuperabilidadResponseDto> {
+    try {
+      const offset = (page - 1) * limit;
+      const segmentFilter = segmento ? `AND segmento = '${segmento}'` : '';
+
+      const baseSql = `
+        WITH max_credito AS (
+          SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito
+        ),
+        creditos_mora AS (
+          SELECT
+            nro_cliente::TEXT,
+            nombres_socio,
+            nro_operacion,
+            COALESCE(CAST(NULLIF(dias_mora, '') AS FLOAT), 0) AS dias,
+            COALESCE(saldo_capital, 0) AS saldo,
+            UPPER(COALESCE(NULLIF(tgarantia, ''), 'QUIROGRAFARIA')) AS garantia,
+            COALESCE(CAST(NULLIF(ingresos_socio, '') AS FLOAT), 0) AS ingresos,
+            COALESCE(CAST(NULLIF(egresos_socio, '') AS FLOAT), 0) AS egresos,
+            fecha_ult_pag
+          FROM sabana_credito
+          WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
+            AND estado_op = 'VIGENTE'
+            AND CAST(NULLIF(dias_mora, '') AS FLOAT) > 0
+        ),
+        scoring AS (
+          SELECT
+            *,
+            -- Score Base: 50%
+            50
+            -- Ajuste por Días de Mora (mientras más antiguo, más difícil)
+            + CASE
+                WHEN dias <= 30 THEN 30
+                WHEN dias <= 90 THEN 10
+                WHEN dias <= 180 THEN -10
+                ELSE -30
+              END
+            -- Ajuste por Garantía
+            + CASE
+                WHEN garantia LIKE '%HIPOTECARI%' THEN 25
+                WHEN garantia LIKE '%PRENDARI%' THEN 15
+                WHEN garantia LIKE '%QUIROGRAFARI%' THEN -10
+                ELSE 0
+              END
+            -- Ajuste por Ingresos Netos (Capacidad de pago)
+            + CASE
+                WHEN (ingresos - egresos) > 500 THEN 15
+                WHEN (ingresos - egresos) > 0 THEN 5
+                ELSE -15
+              END
+            -- Ajuste por Fecha de último pago (si pagó hace poco, hay voluntad)
+            + CASE
+                WHEN fecha_ult_pag IS NOT NULL 
+                     AND DATE_PART('days', NOW() - fecha_ult_pag) < 60 THEN 10
+                ELSE 0
+              END
+            AS raw_score
+          FROM creditos_mora
+        ),
+        resultado AS (
+          SELECT
+            nro_cliente,
+            nombres_socio,
+            nro_operacion,
+            dias AS dias_mora,
+            saldo AS saldo_vencido,
+            garantia AS tipo_garantia,
+            ingresos,
+            
+            LEAST(GREATEST(raw_score, 0), 100) AS score_recuperacion,
+
+            CASE
+              WHEN raw_score >= 70 THEN 'Alta'
+              WHEN raw_score >= 40 THEN 'Media'
+              ELSE 'Baja'
+            END AS segmento,
+
+            CASE
+              WHEN raw_score >= 70 AND (ingresos - egresos) > 0 AND garantia NOT LIKE '%QUIROGRAFARI%' THEN 'Garantía real e ingresos positivos'
+              WHEN raw_score >= 70 AND dias <= 30 THEN 'Mora temprana de fácil gestión'
+              WHEN raw_score < 40 AND (ingresos - egresos) <= 0 THEN 'Sin capacidad de pago aparente'
+              WHEN raw_score < 40 AND dias > 180 THEN 'Mora muy antigua'
+              ELSE 'Factores de recuperación estándar'
+            END AS factor_positivo
+
+          FROM scoring
+        )
+      `;
+
+      const sqlQuery = `
+        ${baseSql}
+        SELECT *
+        FROM resultado
+        WHERE 1=1 ${segmentFilter}
+        ORDER BY score_recuperacion DESC, saldo_vencido DESC
+        LIMIT $1 OFFSET $2;
+      `;
+
+      const sqlResumen = `
+        ${baseSql}
+        SELECT
+          COUNT(*) FILTER (WHERE segmento = 'Alta') AS total_alta,
+          COUNT(*) FILTER (WHERE segmento = 'Media') AS total_media,
+          COUNT(*) FILTER (WHERE segmento = 'Baja') AS total_baja,
+          COALESCE(SUM(saldo_vencido) FILTER (WHERE segmento = 'Alta'), 0) AS monto_alta,
+          COALESCE(SUM(saldo_vencido) FILTER (WHERE segmento = 'Media'), 0) AS monto_media,
+          COALESCE(SUM(saldo_vencido) FILTER (WHERE segmento = 'Baja'), 0) AS monto_baja
+        FROM resultado;
+      `;
+
+      const [rows, [res]] = await Promise.all([
+        this.sabanaCreditoRepo.query(sqlQuery, [limit, offset]),
+        this.sabanaCreditoRepo.query(sqlResumen),
+      ]);
+
+      const resumen: RecuperabilidadResumenDto = {
+        totalAlta:  parseInt(res?.total_alta ?? '0', 10),
+        totalMedia: parseInt(res?.total_media ?? '0', 10),
+        totalBaja:  parseInt(res?.total_baja ?? '0', 10),
+        montoAlta:  parseFloat(parseFloat(res?.monto_alta ?? '0').toFixed(2)),
+        montoMedia: parseFloat(parseFloat(res?.monto_media ?? '0').toFixed(2)),
+        montoBaja:  parseFloat(parseFloat(res?.monto_baja ?? '0').toFixed(2)),
+      };
+
+      const data: SocioRecuperableDto[] = rows.map((r: any) => ({
+        nroCliente:        r.nro_cliente ?? '',
+        nombresSocio:      r.nombres_socio ?? '',
+        nroOperacion:      r.nro_operacion ?? '',
+        diasMora:          parseInt(r.dias_mora ?? '0', 10),
+        saldoVencido:      parseFloat(parseFloat(r.saldo_vencido ?? '0').toFixed(2)),
+        tipoGarantia:      r.tipo_garantia ?? '',
+        segmento:          r.segmento ?? 'Baja',
+        scoreRecuperacion: parseInt(r.score_recuperacion ?? '0', 10),
+        factorPositivo:    r.factor_positivo ?? '',
+        ingresos:          parseFloat(parseFloat(r.ingresos ?? '0').toFixed(2)),
+      }));
+
+      const total = segmento === 'Alta'  ? resumen.totalAlta
+                  : segmento === 'Media' ? resumen.totalMedia
+                  : segmento === 'Baja'  ? resumen.totalBaja
+                  : resumen.totalAlta + resumen.totalMedia + resumen.totalBaja;
+
+      return { resumen, data, page, limit, total };
+
+    } catch (error) {
+      this.logger.error('Error en getRecuperabilidadCartera', error);
       throw error;
     }
   }

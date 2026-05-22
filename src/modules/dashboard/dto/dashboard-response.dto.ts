@@ -358,3 +358,136 @@ export class ConcentracionResponseDto {
   @ApiProperty({ type: [ConcentracionItemDto], description: 'Concentración por ciudad de origen' })
   porCiudad: ConcentracionItemDto[];
 }
+
+// ─── Retención de Socios (Riesgo de Fuga / Liquidez) ─────────────────────────
+
+export class SocioRetencionDto {
+  @ApiProperty({ example: '1234567' })
+  nroCliente: string;
+
+  @ApiProperty({ example: 'JUAN PÉREZ' })
+  nombresSocio: string;
+
+  @ApiProperty({ example: 450.50, description: 'Saldo disponible en su cuenta de ahorros principal' })
+  saldoAhorro: number;
+
+  @ApiProperty({ example: 120, description: 'Días desde el último movimiento transaccional' })
+  diasInactividad: number;
+
+  @ApiProperty({ example: '2025-10-15', description: 'Fecha del último movimiento' })
+  fechaUltMovimiento: string | null;
+
+  @ApiProperty({ example: false, description: '¿Tiene algún crédito activo?' })
+  tieneCredito: boolean;
+
+  @ApiProperty({ example: true, description: '¿Tiene canales digitales activos (Cooplinea)?' })
+  tieneCooplinea: boolean;
+
+  @ApiProperty({ example: 85, description: 'Probabilidad de desvinculación o fuga (0-100)' })
+  probabilidadFuga: number;
+
+  @ApiProperty({ example: 'Alto', description: 'Nivel de riesgo de pérdida del socio' })
+  nivelRiesgo: string;
+
+  @ApiProperty({ example: 'Alta inactividad y sin obligaciones cruzadas' })
+  motivoPrincipal: string;
+}
+
+export class RetencionResumenDto {
+  @ApiProperty({ example: 120 })
+  totalRiesgoAlto: number;
+
+  @ApiProperty({ example: 450 })
+  totalRiesgoMedio: number;
+
+  @ApiProperty({ example: 25000.50, description: 'Saldo total de ahorros perteneciente a los socios en riesgo Alto/Medio (Impacto a liquidez)' })
+  saldoEnRiesgo: number;
+}
+
+export class RetencionResponseDto {
+  @ApiProperty({ type: RetencionResumenDto })
+  resumen: RetencionResumenDto;
+
+  @ApiProperty({ type: [SocioRetencionDto] })
+  data: SocioRetencionDto[];
+
+  @ApiProperty({ example: 1 })
+  page: number;
+
+  @ApiProperty({ example: 20 })
+  limit: number;
+
+  @ApiProperty({ example: 570 })
+  total: number;
+}
+
+// ─── Recuperabilidad de Cartera Vencida ──────────────────────────────────────
+
+export class SocioRecuperableDto {
+  @ApiProperty({ example: '1234567' })
+  nroCliente: string;
+
+  @ApiProperty({ example: 'MARÍA GÓMEZ' })
+  nombresSocio: string;
+
+  @ApiProperty({ example: 'OP-00987654' })
+  nroOperacion: string;
+
+  @ApiProperty({ example: 45, description: 'Días actuales de mora' })
+  diasMora: number;
+
+  @ApiProperty({ example: 12500.50, description: 'Saldo de capital vencido' })
+  saldoVencido: number;
+
+  @ApiProperty({ example: 'HIPOTECARIA', description: 'Tipo de garantía (factor clave de recuperabilidad)' })
+  tipoGarantia: string;
+
+  @ApiProperty({ example: 'Alta', description: 'Probabilidad de recuperar el pago (Alta, Media, Baja)' })
+  segmento: string;
+
+  @ApiProperty({ example: 85, description: 'Score porcentual de recuperabilidad' })
+  scoreRecuperacion: number;
+
+  @ApiProperty({ example: 'Garantía real e ingresos netos positivos' })
+  factorPositivo: string;
+
+  @ApiProperty({ example: 1200.0, description: 'Ingresos reportados del socio' })
+  ingresos: number;
+}
+
+export class RecuperabilidadResumenDto {
+  @ApiProperty({ example: 15 })
+  totalAlta: number;
+
+  @ApiProperty({ example: 45 })
+  totalMedia: number;
+
+  @ApiProperty({ example: 120 })
+  totalBaja: number;
+
+  @ApiProperty({ example: 150000.00, description: 'Monto total (USD) en segmento de Alta Recuperabilidad' })
+  montoAlta: number;
+
+  @ApiProperty({ example: 450000.00 })
+  montoMedia: number;
+
+  @ApiProperty({ example: 850000.00 })
+  montoBaja: number;
+}
+
+export class RecuperabilidadResponseDto {
+  @ApiProperty({ type: RecuperabilidadResumenDto })
+  resumen: RecuperabilidadResumenDto;
+
+  @ApiProperty({ type: [SocioRecuperableDto] })
+  data: SocioRecuperableDto[];
+
+  @ApiProperty({ example: 1 })
+  page: number;
+
+  @ApiProperty({ example: 20 })
+  limit: number;
+
+  @ApiProperty({ example: 180 })
+  total: number;
+}

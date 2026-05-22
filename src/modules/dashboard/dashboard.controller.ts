@@ -18,6 +18,8 @@ import {
   PredictionsResponseDto,
   CuotasRiesgoResponseDto,
   ConcentracionResponseDto,
+  RetencionResponseDto,
+  RecuperabilidadResponseDto,
 } from './dto/dashboard-response.dto';
 
 @ApiTags('Dashboard')
@@ -136,5 +138,59 @@ export class DashboardController {
   @ApiResponse({ status: 200, type: ConcentracionResponseDto })
   getConcentracionCartera(): Promise<ConcentracionResponseDto> {
     return this.dashboardService.getConcentracionCartera();
+  }
+
+  @Get('retencion')
+  @ApiOperation({
+    summary: 'Retención de Socios y Liquidez',
+    description: 'Predice el riesgo de fuga de capital o desvinculación de los socios basándose en inactividad transaccional, vaciado de cuentas y falta de obligaciones cruzadas.',
+  })
+  @ApiQuery({ name: 'page',   required: false, example: 1,  description: 'Página (por defecto: 1)' })
+  @ApiQuery({ name: 'limit',  required: false, example: 20, description: 'Límite por página (por defecto: 20)' })
+  @ApiQuery({ name: 'riesgo', required: false, example: 'Alto', description: 'Filtrar por riesgo: Alto | Medio' })
+  @ApiResponse({ status: 200, type: RetencionResponseDto })
+  getRetencionSocios(
+    @Query('page')   page?:   string,
+    @Query('limit')  limit?:  string,
+    @Query('riesgo') riesgo?: string,
+  ): Promise<RetencionResponseDto> {
+    const pageNum  = page  ? parseInt(page,  10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 20;
+
+    if (isNaN(pageNum)  || pageNum  <= 0) throw new BadRequestException('El parámetro page debe ser mayor a 0');
+    if (isNaN(limitNum) || limitNum <= 0) throw new BadRequestException('El parámetro limit debe ser mayor a 0');
+    if (limitNum > 100)                   throw new BadRequestException('El parámetro limit no puede superar 100');
+    if (riesgo && !['Alto', 'Medio', 'Bajo'].includes(riesgo)) {
+      throw new BadRequestException('riesgo debe ser Alto, Medio o Bajo');
+    }
+
+    return this.dashboardService.getRetencionSocios(pageNum, limitNum, riesgo);
+  }
+
+  @Get('recuperabilidad')
+  @ApiOperation({
+    summary: 'Recuperabilidad de Cartera Vencida',
+    description: 'Predice la probabilidad de recuperación de créditos en mora basándose en antigüedad, garantías e ingresos.',
+  })
+  @ApiQuery({ name: 'page',     required: false, example: 1,  description: 'Página' })
+  @ApiQuery({ name: 'limit',    required: false, example: 20, description: 'Límite' })
+  @ApiQuery({ name: 'segmento', required: false, example: 'Alta', description: 'Alta | Media | Baja' })
+  @ApiResponse({ status: 200, type: RecuperabilidadResponseDto })
+  getRecuperabilidadCartera(
+    @Query('page')     page?:     string,
+    @Query('limit')    limit?:    string,
+    @Query('segmento') segmento?: string,
+  ): Promise<RecuperabilidadResponseDto> {
+    const pageNum  = page  ? parseInt(page,  10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 20;
+
+    if (isNaN(pageNum)  || pageNum  <= 0) throw new BadRequestException('El parámetro page debe ser mayor a 0');
+    if (isNaN(limitNum) || limitNum <= 0) throw new BadRequestException('El parámetro limit debe ser mayor a 0');
+    if (limitNum > 100)                   throw new BadRequestException('El parámetro limit no puede superar 100');
+    if (segmento && !['Alta', 'Media', 'Baja'].includes(segmento)) {
+      throw new BadRequestException('segmento debe ser Alta, Media o Baja');
+    }
+
+    return this.dashboardService.getRecuperabilidadCartera(pageNum, limitNum, segmento);
   }
 }
