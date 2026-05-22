@@ -4,14 +4,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { DatabaseService } from './services/database.service';
 
-// Entidades de seguridad
-import { Usuario } from '@/modules/auth/entities/usuario.entity';
-import { Rol } from '@/modules/auth/entities/rol.entity';
-import { Permiso } from '@/modules/auth/entities/permiso.entity';
-import { Token } from '@/modules/auth/entities/token.entity';
-import { Sesion } from '@/modules/auth/entities/sesion.entity';
-import { PasswordRecoveryCode } from '@/modules/auth/entities/password-recovery-code.entity';
-
 
 @Module({
   imports: [
@@ -28,8 +20,8 @@ import { PasswordRecoveryCode } from '@/modules/auth/entities/password-recovery-
         database: config.get<string>('SEGURIDAD_DB_NAME'),
         synchronize: false,
         logging: true,
-        ssl: false,
-        entities: [Usuario, Rol, Permiso, Token, Sesion, PasswordRecoveryCode],
+        entities: [],
+        autoLoadEntities: true,
       }),
     }),
   ],

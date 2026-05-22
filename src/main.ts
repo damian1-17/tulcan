@@ -56,19 +56,9 @@ async function bootstrap() {
 
   // Swagger
   const config = new DocumentBuilder()
-    .setTitle('Auth API')
-    .setDescription('API de autenticación con JWT en cookies')
+    .setTitle('Dashboard API')
+    .setDescription('API del Módulo de Dashboard')
     .setVersion('1.0')
-    .addCookieAuth('accessToken', {
-      type: 'apiKey',
-      in: 'cookie',
-      name: 'accessToken',
-    })
-    .addCookieAuth('refreshToken', {
-      type: 'apiKey',
-      in: 'cookie',
-      name: 'refreshToken',
-    })
     .build();
 
   const document = SwaggerModule.createDocument(app, config);
@@ -79,7 +69,6 @@ async function bootstrap() {
 
   console.log(`Aplicación corriendo en: http://localhost:${port}`);
   console.log(`Documentación Swagger: http://localhost:${port}/api/docs`);
-  console.log(`JWT usando cookies HttpOnly`);
 }
 
 bootstrap();
