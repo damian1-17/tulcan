@@ -77,6 +77,12 @@ export class SocioRiesgoDto {
   @ApiProperty({ example: 'Saldo ahorro cayó 78% en las últimas semanas', description: 'Señal principal de alerta detectada para el socio' })
   senalPrincipal: string;
 
+  @ApiProperty({ example: 1245.80, description: 'Saldo disponible promedio del socio a través de todos los cortes históricos (USD)' })
+  saldoPromedio: number;
+
+  @ApiProperty({ example: 34.7, description: 'Probabilidad de caer en mora calculada a partir del score global mediante función sigmoide (%)' })
+  probabilidadMora: number;
+
   @ApiProperty({ type: [DimensionScoreDto], description: 'Desglose por cada dimensión de riesgo' })
   dimensiones: DimensionScoreDto[];
 }
@@ -104,6 +110,12 @@ export class DelinquencyRiskResponseDto {
 
   @ApiProperty({ example: 99636, description: 'Total de socios analizados' })
   totalSocios: number;
+
+  @ApiProperty({ example: 48250000.75, description: 'Suma total del saldo de capital de créditos vigentes en el último corte (USD)' })
+  carteraTotal: number;
+
+  @ApiProperty({ example: 3.47, description: 'Tasa de mora actual: saldo en mora / cartera total × 100 (definición bancaria estándar, %)' })
+  tasaMoraActual: number;
 
   @ApiProperty({ type: DistribucionRiesgoDto, description: 'Distribución de socios por nivel de riesgo' })
   distribucion: DistribucionRiesgoDto;

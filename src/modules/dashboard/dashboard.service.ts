@@ -218,11 +218,21 @@ export class DashboardService {
           GROUP BY nro_cliente
         ),
 
+        -- ─── Saldo promedio histórico por socio ─────────────────────────────
+        avg_saldo AS (
+          SELECT
+            v_ah_cliente,
+            ROUND(CAST(AVG(saldo_disponible) AS NUMERIC), 2) AS saldo_promedio
+          FROM sabana_ahorro
+          GROUP BY v_ah_cliente
+        ),
+
         -- ─── Scoring por socio ────────────────────────────────────────────────
         scoring AS (
           SELECT
             a.v_ah_cliente,
             a.v_ah_nombre,
+            COALESCE(av.saldo_promedio, a.saldo_disponible) AS saldo_promedio,
 
             /* D1: Comportamiento Transaccional (20%) */
             LEAST(100, GREATEST(0,
@@ -432,6 +442,7 @@ export class DashboardService {
           LEFT JOIN prev_base      p  ON a.v_ah_cliente = p.v_ah_cliente
           LEFT JOIN credit_profile c  ON CAST(a.v_ah_cliente AS BIGINT)::TEXT = c.nro_cliente
           LEFT JOIN tx_activity    tx ON a.v_ah_cliente = tx.v_ah_cliente
+          LEFT JOIN avg_saldo      av ON a.v_ah_cliente = av.v_ah_cliente
         ),
 
         -- ─── Score global por socio ───────────────────────────────────────────
@@ -445,6 +456,7 @@ export class DashboardService {
             d4_externo,
             d5_deterioro,
             senal_principal,
+            saldo_promedio,
             ROUND(CAST(
               (d1_transaccional * 0.20) +
               (d2_crediticio    * 0.35) +
@@ -464,7 +476,11 @@ export class DashboardService {
           d4_externo,
           d5_deterioro,
           senal_principal,
+          saldo_promedio,
           score_global,
+          ROUND(CAST(
+            100.0 / (1.0 + EXP(-0.09 * (score_global - 45)))
+          AS NUMERIC), 1) AS prob_mora,
           CASE
             WHEN score_global <= 30 THEN 'Bajo'
             WHEN score_global <= 60 THEN 'Medio'
@@ -571,7 +587,32 @@ export class DashboardService {
           SUM(CASE WHEN sg BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS alto,
           SUM(CASE WHEN sg > 80 THEN 1 ELSE 0 END) AS critico,
           (SELECT fecha FROM max_ahorro)  AS fecha_ahorro,
-          (SELECT fecha FROM max_credito) AS fecha_credito
+          (SELECT fecha FROM max_credito) AS fecha_credito,
+
+          /* Cartera total: suma de saldo capital de créditos vigentes en el último corte */
+          (
+            SELECT ROUND(CAST(SUM(saldo_capital) AS NUMERIC), 2)
+            FROM sabana_credito
+            WHERE qy_fechaproc = (SELECT MAX(qy_fechaproc) FROM sabana_credito)
+              AND estado_op = 'VIGENTE'
+              AND saldo_capital IS NOT NULL
+          ) AS cartera_total,
+
+          /* Tasa de mora: saldo en mora / cartera total * 100 (definición bancaria estándar) */
+          (
+            SELECT ROUND(CAST(
+              SUM(CASE
+                WHEN COALESCE(CAST(NULLIF(dias_mora, '') AS FLOAT), 0) > 0
+                     THEN saldo_capital ELSE 0
+              END) /
+              NULLIF(SUM(saldo_capital), 0) * 100
+            AS NUMERIC), 2)
+            FROM sabana_credito
+            WHERE qy_fechaproc = (SELECT MAX(qy_fechaproc) FROM sabana_credito)
+              AND estado_op = 'VIGENTE'
+              AND saldo_capital IS NOT NULL
+          ) AS tasa_mora
+
         FROM resultado;
       `;
 
@@ -598,11 +639,13 @@ export class DashboardService {
         ];
 
         return {
-          nroCliente:     String(Math.floor(parseFloat(r.v_ah_cliente))),
-          nombre:         r.v_ah_nombre ?? '',
-          scoreGlobal:    parseFloat(r.score_global),
-          nivelRiesgo:    r.nivel_riesgo,
-          senalPrincipal: r.senal_principal ?? 'Sin señal crítica identificada',
+          nroCliente:       String(Math.floor(parseFloat(r.v_ah_cliente))),
+          nombre:           r.v_ah_nombre ?? '',
+          scoreGlobal:      parseFloat(r.score_global),
+          nivelRiesgo:      r.nivel_riesgo,
+          senalPrincipal:   r.senal_principal ?? 'Sin señal crítica identificada',
+          saldoPromedio:    parseFloat(parseFloat(r.saldo_promedio ?? '0').toFixed(2)),
+          probabilidadMora: parseFloat(parseFloat(r.prob_mora     ?? '0').toFixed(1)),
           dimensiones,
         };
       });
@@ -617,7 +660,9 @@ export class DashboardService {
       return {
         fechaCorteAhorro:  dist?.fecha_ahorro  ? (new Date(dist.fecha_ahorro).toISOString().split('T')[0]  ?? '') : '',
         fechaCorteCredito: dist?.fecha_credito ? (new Date(dist.fecha_credito).toISOString().split('T')[0] ?? '') : '',
-        totalSocios:       parseInt(dist?.total ?? '0', 10),
+        totalSocios:       parseInt(dist?.total        ?? '0', 10),
+        carteraTotal:      parseFloat(parseFloat(dist?.cartera_total ?? '0').toFixed(2)),
+        tasaMoraActual:    parseFloat(parseFloat(dist?.tasa_mora     ?? '0').toFixed(2)),
         distribucion,
         data,
         page,
