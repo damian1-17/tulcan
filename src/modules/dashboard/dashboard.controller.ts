@@ -15,6 +15,8 @@ import { DashboardService }          from './dashboard.service';
 import {
   ActiveCreditsResponseDto,
   DelinquencyRiskResponseDto,
+  PredictionsResponseDto,
+  CuotasRiesgoResponseDto,
 } from './dto/dashboard-response.dto';
 
 @ApiTags('Dashboard')
@@ -67,5 +69,61 @@ export class DashboardController {
     if (limitNum > 100)                   throw new BadRequestException('El parámetro limit no puede superar 100');
 
     return this.dashboardService.getDelinquencyRisk(pageNum, limitNum, nivel);
+  }
+
+  @Get('predictions')
+  @ApiOperation({
+    summary: 'Predicción de morosidad a 10, 20 y 30 días',
+    description: 'Identifica socios con alta probabilidad de caer en mora en los próximos 10, 20 o 30 días utilizando el modelo de 7 dimensiones más probabilidades sigmóide por horizonte temporal.',
+  })
+  @ApiQuery({ name: 'page',      required: false, example: 1,    description: 'Página (por defecto: 1)' })
+  @ApiQuery({ name: 'limit',     required: false, example: 20,   description: 'Límite por página (por defecto: 20)' })
+  @ApiQuery({ name: 'horizonte', required: false, example: '10', description: 'Filtrar por horizonte: 10 | 20 | 30 (días). Sin valor = todos' })
+  @ApiResponse({ status: 200, type: PredictionsResponseDto })
+  getPredictions(
+    @Query('page')      page?:      string,
+    @Query('limit')     limit?:     string,
+    @Query('horizonte') horizonte?: string,
+  ): Promise<PredictionsResponseDto> {
+    const pageNum  = page  ? parseInt(page,  10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 20;
+
+    if (isNaN(pageNum)  || pageNum  <= 0) throw new BadRequestException('El parámetro page debe ser mayor a 0');
+    if (isNaN(limitNum) || limitNum <= 0) throw new BadRequestException('El parámetro limit debe ser mayor a 0');
+    if (limitNum > 100)                   throw new BadRequestException('El parámetro limit no puede superar 100');
+    if (horizonte && !['10','20','30'].includes(horizonte))
+      throw new BadRequestException('El horizonte debe ser 10, 20 o 30');
+
+    return this.dashboardService.getPredictions(pageNum, limitNum, horizonte);
+  }
+
+  @Get('cuotas-riesgo')
+  @ApiOperation({
+    summary: 'Cuotas próximas en riesgo',
+    description: 'Lista las cuotas de crédito que vencen en los próximos 7, 15 o 30 días ordenadas por prioridad de atención (CRÍTICA, ALTA, MEDIA, BAJA). La fecha de próximo pago se estima a partir de la última cuota pagada más un mes.',
+  })
+  @ApiQuery({ name: 'page',      required: false, example: 1,    description: 'Página (por defecto: 1)' })
+  @ApiQuery({ name: 'limit',     required: false, example: 20,   description: 'Límite por página (por defecto: 20, máx 100)' })
+  @ApiQuery({ name: 'ventana',   required: false, example: 30,   description: 'Ventana de días hacia adelante: 7 | 15 | 30 (por defecto: 30)' })
+  @ApiQuery({ name: 'prioridad', required: false, example: 'ALTA', description: 'Filtrar por prioridad: CRÍTICA | ALTA | MEDIA | BAJA' })
+  @ApiResponse({ status: 200, type: CuotasRiesgoResponseDto })
+  getCuotasEnRiesgo(
+    @Query('page')      page?:      string,
+    @Query('limit')     limit?:     string,
+    @Query('ventana')   ventana?:   string,
+    @Query('prioridad') prioridad?: string,
+  ): Promise<CuotasRiesgoResponseDto> {
+    const pageNum    = page    ? parseInt(page,    10) : 1;
+    const limitNum   = limit   ? parseInt(limit,   10) : 20;
+    const ventanaNum = ventana ? parseInt(ventana, 10) : 30;
+
+    if (isNaN(pageNum)    || pageNum    <= 0) throw new BadRequestException('El parámetro page debe ser mayor a 0');
+    if (isNaN(limitNum)   || limitNum   <= 0) throw new BadRequestException('El parámetro limit debe ser mayor a 0');
+    if (limitNum > 100)                       throw new BadRequestException('El parámetro limit no puede superar 100');
+    if (![7, 15, 30].includes(ventanaNum))    throw new BadRequestException('ventana debe ser 7, 15 o 30');
+    if (prioridad && !['CRÍTICA','ALTA','MEDIA','BAJA'].includes(prioridad))
+      throw new BadRequestException('prioridad debe ser CRÍTICA, ALTA, MEDIA o BAJA');
+
+    return this.dashboardService.getCuotasEnRiesgo(pageNum, limitNum, ventanaNum, prioridad);
   }
 }

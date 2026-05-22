@@ -12,6 +12,12 @@ import {
   SocioRiesgoDto,
   DimensionScoreDto,
   DistribucionRiesgoDto,
+  SocioPrediccionDto,
+  PredictionResumenDto,
+  PredictionsResponseDto,
+  CuotaRiesgoDto,
+  CuotasRiesgoResumenDto,
+  CuotasRiesgoResponseDto,
 } from './dto/dashboard-response.dto';
 
 @Injectable()
@@ -819,6 +825,503 @@ export class DashboardService {
       };
     } catch (error) {
       this.logger.error('Error en getDelinquencyRisk', error);
+      throw error;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Predicción de morosidad (horizonte 10, 20, 30 días)
+  // ─────────────────────────────────────────────────────────────────────────────
+  async getPredictions(
+    page:     number,
+    limit:    number,
+    horizonte?: string,  // '10' | '20' | '30'
+  ): Promise<PredictionsResponseDto> {
+    try {
+      const offset = (page - 1) * limit;
+
+      let horizonteFilter = '';
+      if (horizonte === '10') horizonteFilter = `AND horizonte = '10 días'`;
+      if (horizonte === '20') horizonteFilter = `AND horizonte = '20 días'`;
+      if (horizonte === '30') horizonteFilter = `AND horizonte = '30 días'`;
+
+      // ─── SQL base (mismas CTEs que delinquency-risk) ──────────────────────
+      const baseCtes = `
+        max_ahorro  AS (SELECT MAX(fecha_proceso) AS fecha FROM sabana_ahorro),
+        prev_ahorro AS (
+          SELECT fecha_proceso AS fecha FROM sabana_ahorro
+          GROUP BY fecha_proceso ORDER BY fecha_proceso LIMIT 1
+        ),
+        max_credito AS (SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito),
+        base_ahorro AS (
+          SELECT DISTINCT ON (v_ah_cliente)
+            v_ah_cliente, v_ah_nombre, saldo_disponible, monto_bloq,
+            val_de_creditos, val_de_debitos
+          FROM sabana_ahorro WHERE fecha_proceso = (SELECT fecha FROM max_ahorro)
+          ORDER BY v_ah_cliente, saldo_disponible DESC
+        ),
+        prev_base AS (
+          SELECT DISTINCT ON (v_ah_cliente) v_ah_cliente,
+            saldo_disponible AS saldo_prev
+          FROM sabana_ahorro WHERE fecha_proceso = (SELECT fecha FROM prev_ahorro)
+          ORDER BY v_ah_cliente
+        ),
+        credit_profile AS (
+          SELECT nro_cliente,
+            MAX(CASE calificacion WHEN 'A1' THEN 5  WHEN 'A2' THEN 25 WHEN 'A3' THEN 45
+              WHEN 'B1' THEN 60 WHEN 'B2' THEN 75 WHEN 'C1' THEN 85 WHEN 'C2' THEN 90
+              WHEN 'D' THEN 95 WHEN 'E' THEN 100 ELSE 0 END)            AS cal_score,
+            MAX(COALESCE(CAST(NULLIF(dias_mora,'') AS FLOAT), 0))        AS max_dias_mora,
+            MAX(COALESCE(CAST(NULLIF(nro_cuotas_atra,'') AS FLOAT), 0)) AS max_cuotas_atra,
+            MAX(COALESCE(CAST(NULLIF(nro_cargas_fam,'') AS FLOAT), 0))  AS max_cargas,
+            MAX(COALESCE(CAST(NULLIF(ingresos_socio,'') AS FLOAT), 0))  AS ingresos,
+            MAX(COALESCE(CAST(NULLIF(egresos_socio,'')  AS FLOAT), 0))  AS egresos,
+            MAX(COALESCE(tipo_vivien,  ''))                              AS tipo_vivien,
+            MAX(COALESCE(nivel_educa,  ''))                              AS nivel_educa,
+            MAX(COALESCE(estado_civil, ''))                              AS estado_civil,
+            MAX(COALESCE(actividad_socio, ''))                           AS actividad_socio,
+            MAX(COALESCE(destino_op, ''))                                AS destino_op,
+            MAX(COALESCE(tgarantia, ''))                                 AS tgarantia,
+            MAX(COALESCE(CAST(NULLIF(valgarantias,'') AS FLOAT), 0))     AS valgarantias,
+            MAX(COALESCE(CAST(NULLIF(monto_credito,'') AS FLOAT), 0))    AS monto_credito_max,
+            MAX(COALESCE(saldo_capital, 0))                              AS saldo_capital
+          FROM sabana_credito WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
+          GROUP BY nro_cliente
+        ),
+        tx_activity AS (
+          SELECT CAST(nro_cliente AS BIGINT) AS v_ah_cliente, COUNT(*) AS num_tx
+          FROM transacciones WHERE fecha_trn >= NOW() - INTERVAL '60 days'
+            AND nro_cliente IS NOT NULL GROUP BY nro_cliente
+        ),
+        avg_saldo AS (
+          SELECT v_ah_cliente,
+            ROUND(CAST(AVG(saldo_disponible) AS NUMERIC), 2) AS saldo_promedio
+          FROM sabana_ahorro GROUP BY v_ah_cliente
+        ),
+        scoring AS (
+          SELECT
+            a.v_ah_cliente, a.v_ah_nombre,
+            COALESCE(av.saldo_promedio, a.saldo_disponible) AS saldo_promedio,
+            COALESCE(c.max_dias_mora, 0)  AS max_dias_mora,
+            COALESCE(c.saldo_capital, 0)  AS saldo_capital,
+            -- D1: Comportamiento Transaccional (15%)
+            LEAST(100, GREATEST(0,
+              CASE WHEN tx.num_tx IS NULL THEN 75 WHEN tx.num_tx<3 THEN 55
+                   WHEN tx.num_tx<10 THEN 30 WHEN tx.num_tx<20 THEN 15 ELSE 5 END +
+              CASE WHEN (a.val_de_debitos>0 AND a.val_de_creditos=0) THEN 15
+                   WHEN (a.val_de_debitos>a.val_de_creditos*2) THEN 10 ELSE 0 END
+            )) AS d1,
+            -- D2: Estabilidad de Ahorro (20%)
+            LEAST(100, GREATEST(0, CASE
+              WHEN p.saldo_prev IS NULL OR p.saldo_prev<=0 THEN
+                CASE WHEN a.saldo_disponible<50 THEN 60 ELSE 15 END
+              WHEN ((p.saldo_prev-a.saldo_disponible)/p.saldo_prev)>=0.70 THEN 90
+              WHEN ((p.saldo_prev-a.saldo_disponible)/p.saldo_prev)>=0.50 THEN 70
+              WHEN ((p.saldo_prev-a.saldo_disponible)/p.saldo_prev)>=0.25 THEN 45
+              WHEN a.saldo_disponible<50 THEN 35 WHEN a.monto_bloq>0 THEN 20
+              WHEN a.saldo_disponible>p.saldo_prev THEN 5 ELSE 10 END
+            )) AS d2,
+            -- D3: Historial Crediticio (25%)
+            COALESCE(LEAST(100,(c.cal_score*0.50)+
+              (CASE WHEN COALESCE(c.max_dias_mora,0)=0 THEN 0
+                WHEN c.max_dias_mora<=15 THEN 20 WHEN c.max_dias_mora<=30 THEN 40
+                WHEN c.max_dias_mora<=60 THEN 70 ELSE 100 END*0.30)+
+              (CASE WHEN COALESCE(c.max_cuotas_atra,0)=0 THEN 0
+                WHEN c.max_cuotas_atra=1 THEN 20 WHEN c.max_cuotas_atra=2 THEN 45
+                ELSE 80 END*0.20)),0) AS d3,
+            -- D4: Señales de Deterioro (10%)
+            LEAST(100, GREATEST(0,
+              CASE WHEN COALESCE(c.max_dias_mora,0)>0
+                        AND p.saldo_prev IS NOT NULL
+                        AND a.saldo_disponible<p.saldo_prev*0.75 THEN 90 ELSE 0 END+
+              CASE WHEN tx.num_tx IS NULL AND p.saldo_prev IS NOT NULL
+                        AND a.saldo_disponible<p.saldo_prev*0.80 THEN 60 ELSE 0 END+
+              CASE WHEN a.monto_bloq>0 AND COALESCE(c.max_dias_mora,0)>0
+                   THEN 40 ELSE 0 END
+            )) AS d4,
+            -- D5: Perfil Socioeconómico (15%)
+            LEAST(100, GREATEST(0,
+              (CASE WHEN COALESCE(c.ingresos,0)=0 THEN 45
+                WHEN (c.egresos/NULLIF(c.ingresos,0))>0.85 THEN 65
+                WHEN (c.egresos/NULLIF(c.ingresos,0))>0.60 THEN 35 ELSE 10 END*0.30)+
+              (CASE WHEN c.max_cargas=0 THEN 0 WHEN c.max_cargas<=2 THEN 15
+                WHEN c.max_cargas<=4 THEN 35 ELSE 55 END*0.20)+
+              (CASE UPPER(COALESCE(c.tipo_vivien,''))
+                WHEN 'PROPIA' THEN 0 WHEN 'FAMILIAR' THEN 15
+                WHEN 'ARRENDADA' THEN 30 ELSE 20 END*0.15)+
+              (CASE
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('SUPERIOR','POSTGRADO','TERCER NIVEL','4TO NIVEL','CUARTO NIVEL') THEN 5
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('BACHILLERATO','SECUNDARIA','BACHILLER') THEN 15
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('PRIMARIA','BASICA','BÁSICA') THEN 28
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('NINGUNA','NINGUNO') THEN 45
+                ELSE 20 END*0.20)+
+              (CASE
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('CASADO','CASADA','UNION LIBRE','UNION DE HECHO','UNIÓN LIBRE') THEN 5
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('SOLTERO','SOLTERA') THEN 15
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('DIVORCIADO','DIVORCIADA','SEPARADO','SEPARADA') THEN 22
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('VIUDO','VIUDA') THEN 28
+                ELSE 15 END*0.15)
+            )) AS d5,
+            -- D6: Actividad Económica (10%)
+            LEAST(100, GREATEST(0,
+              (CASE WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%AGRICULTUR%' THEN 40
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%GANADERIA%' THEN 38
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%PESCA%' THEN 42
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%CONSTRUCCI%' THEN 30
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%COMERCIO%' THEN 25
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%SERVICIO%' THEN 20
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%INDUSTRI%' THEN 22
+                WHEN c.actividad_socio IS NULL OR c.actividad_socio='' THEN 35 ELSE 28 END*0.50)+
+              (CASE WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%VIVIENDA%' THEN 10
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%CAPITAL%' THEN 20
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%PRODUCTI%' THEN 18
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%CONSUMO%' THEN 35
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%AGRICULT%' THEN 38
+                WHEN c.destino_op IS NULL OR c.destino_op='' THEN 30 ELSE 28 END*0.50)
+            )) AS d6,
+            -- D7: Garantías (5%)
+            LEAST(100, GREATEST(0,
+              (CASE WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%HIPOTECARIA%' THEN 5
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%PRENDARIA%' THEN 15
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%PERSONAL%' THEN 25
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%QUIROG%' THEN 35
+                WHEN c.tgarantia IS NULL OR c.tgarantia='' THEN 40 ELSE 30 END*0.60)+
+              (CASE WHEN COALESCE(c.monto_credito_max,0)=0 THEN 35
+                WHEN c.valgarantias>=c.monto_credito_max*1.5 THEN 5
+                WHEN c.valgarantias>=c.monto_credito_max THEN 12
+                WHEN c.valgarantias>=c.monto_credito_max*0.5 THEN 25
+                WHEN c.valgarantias>0 THEN 40 ELSE 55 END*0.40)
+            )) AS d7,
+            -- Señal principal
+            CASE
+              WHEN COALESCE(c.max_dias_mora,0) BETWEEN 1 AND 15
+                THEN 'Micro-retraso activo: ' || FLOOR(COALESCE(c.max_dias_mora,0))::TEXT || ' días'
+              WHEN COALESCE(c.max_dias_mora,0) BETWEEN 16 AND 30
+                THEN 'En mora: ' || FLOOR(COALESCE(c.max_dias_mora,0))::TEXT || ' días sin regularizar'
+              WHEN p.saldo_prev IS NOT NULL AND p.saldo_prev > 0
+                AND a.saldo_disponible < p.saldo_prev * 0.40
+                THEN 'Ahorro cayó más del 60% — alerta crítica'
+              WHEN tx.num_tx IS NULL AND p.saldo_prev IS NOT NULL
+                AND a.saldo_disponible < p.saldo_prev * 0.80
+                THEN 'Sin actividad transaccional + ahorro en declive'
+              WHEN a.saldo_disponible < 50
+                THEN 'Saldo disponible prácticamente en cero'
+              ELSE 'Riesgo compuesto: múltiples factores elevados'
+            END AS senal_principal
+          FROM base_ahorro a
+          LEFT JOIN prev_base     p  ON a.v_ah_cliente = p.v_ah_cliente
+          LEFT JOIN credit_profile c ON CAST(a.v_ah_cliente AS BIGINT)::TEXT = c.nro_cliente
+          LEFT JOIN tx_activity   tx ON a.v_ah_cliente = tx.v_ah_cliente
+          LEFT JOIN avg_saldo     av ON a.v_ah_cliente = av.v_ah_cliente
+        ),
+        resultado AS (
+          SELECT
+            v_ah_cliente, v_ah_nombre, saldo_promedio, senal_principal,
+            max_dias_mora, saldo_capital, d1, d2, d3, d4, d5, d6, d7,
+            ROUND(CAST((d1*0.15)+(d2*0.20)+(d3*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05) AS NUMERIC),2) AS sg,
+            -- Probabilidades sigmoides por horizonte
+            ROUND(100.0/(1.0+EXP(-0.12*(((d1*0.15)+(d2*0.20)+(d3*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05))-70))) ::NUMERIC,1) AS prob_10d,
+            ROUND(100.0/(1.0+EXP(-0.11*(((d1*0.15)+(d2*0.20)+(d3*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05))-57))) ::NUMERIC,1) AS prob_20d,
+            ROUND(100.0/(1.0+EXP(-0.09*(((d1*0.15)+(d2*0.20)+(d3*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05))-45))) ::NUMERIC,1) AS prob_30d
+          FROM scoring
+        ),
+        predicciones AS (
+          SELECT *,
+            -- ─ Horizonte de predicción ─
+            CASE
+              /* 10 días: ya tiene micro-mora activa o señales de deterioro críticas */
+              WHEN (max_dias_mora BETWEEN 1 AND 20) AND prob_10d >= 55 THEN '10 días'
+              /* 20 días: sin mora formal pero ahorro cayendo + inactividad */
+              WHEN max_dias_mora = 0 AND d2 >= 62 AND d4 >= 35 AND prob_20d >= 48 THEN '20 días'
+              /* 30 días: riesgo compuesto moderado sin señales inmediatas */
+              WHEN max_dias_mora = 0 AND sg >= 40 AND prob_30d >= 40 THEN '30 días'
+              ELSE NULL
+            END AS horizonte,
+            -- ─ Factor principal ─
+            CASE
+              WHEN max_dias_mora BETWEEN 1 AND 10
+                THEN 'Micro-retraso activo: ' || FLOOR(max_dias_mora)::TEXT || ' días sin pagar'
+              WHEN max_dias_mora BETWEEN 11 AND 20
+                THEN 'Retraso moderado: ' || FLOOR(max_dias_mora)::TEXT || ' días — riesgo de formalización'
+              WHEN d4 >= 80
+                THEN 'Tres señales de deterioro activas simultáneamente'
+              WHEN d2 >= 70
+                THEN 'Caída drástica del ahorro (>50%) en período reciente'
+              WHEN d3 >= 75
+                THEN 'Calificación crediticia deteriorada (B2, C o peor)'
+              WHEN d5 >= 65
+                THEN 'Alta presión económica familiar y laboral'
+              WHEN d6 >= 65
+                THEN 'Sector laboral de ingresos variables (agro, pesca, etc.)'
+              ELSE 'Score compuesto elevado: varios factores de riesgo combinados'
+            END AS factor_principal,
+            CASE
+              WHEN sg <= 30 THEN 'Bajo'
+              WHEN sg <= 60 THEN 'Medio'
+              WHEN sg <= 80 THEN 'Alto'
+              ELSE 'Crítico'
+            END AS nivel_riesgo
+          FROM resultado
+          WHERE sg > 30  -- excluir socios de riesgo bajo absoluto
+        )
+      `;
+
+      // ─── Query paginada ───────────────────────────────────────────────────
+      const sql = `
+        WITH ${baseCtes}
+        SELECT
+          v_ah_cliente, v_ah_nombre, horizonte, sg,
+          prob_10d, prob_20d, prob_30d,
+          saldo_capital, saldo_promedio,
+          factor_principal, senal_principal, nivel_riesgo
+        FROM predicciones
+        WHERE horizonte IS NOT NULL ${horizonteFilter}
+        ORDER BY
+          CASE horizonte WHEN '10 días' THEN 1 WHEN '20 días' THEN 2 ELSE 3 END,
+          sg DESC
+        LIMIT $1 OFFSET $2;
+      `;
+
+      // ─── Query resumen (totales por horizonte + montos) ────────────────────
+      const sqlResumen = `
+        WITH ${baseCtes}
+        SELECT
+          COUNT(*) FILTER (WHERE horizonte = '10 días') AS total_10d,
+          COUNT(*) FILTER (WHERE horizonte = '20 días') AS total_20d,
+          COUNT(*) FILTER (WHERE horizonte = '30 días') AS total_30d,
+          COUNT(*) FILTER (WHERE horizonte IS NOT NULL) AS total_general,
+          COALESCE(SUM(saldo_capital) FILTER (WHERE horizonte = '10 días'), 0) AS monto_10d,
+          COALESCE(SUM(saldo_capital) FILTER (WHERE horizonte = '20 días'), 0) AS monto_20d,
+          COALESCE(SUM(saldo_capital) FILTER (WHERE horizonte = '30 días'), 0) AS monto_30d,
+          COALESCE(SUM(saldo_capital) FILTER (WHERE horizonte IS NOT NULL), 0) AS monto_total
+        FROM predicciones;
+      `;
+
+      const [rows, [resRow]] = await Promise.all([
+        this.sabanaAhorroRepo.query(sql, [limit, offset]),
+        this.sabanaAhorroRepo.query(sqlResumen),
+      ]);
+
+      const resumen: PredictionResumenDto = {
+        total10d:           parseInt(resRow?.total_10d     ?? '0', 10),
+        total20d:           parseInt(resRow?.total_20d     ?? '0', 10),
+        total30d:           parseInt(resRow?.total_30d     ?? '0', 10),
+        totalGeneral:       parseInt(resRow?.total_general ?? '0', 10),
+        montoEnRiesgo10d:   parseFloat(parseFloat(resRow?.monto_10d    ?? '0').toFixed(2)),
+        montoEnRiesgo20d:   parseFloat(parseFloat(resRow?.monto_20d    ?? '0').toFixed(2)),
+        montoEnRiesgo30d:   parseFloat(parseFloat(resRow?.monto_30d    ?? '0').toFixed(2)),
+        montoTotalEnRiesgo: parseFloat(parseFloat(resRow?.monto_total  ?? '0').toFixed(2)),
+      };
+
+      const data: SocioPrediccionDto[] = rows.map((r: any) => ({
+        nroCliente:     String(Math.floor(parseFloat(r.v_ah_cliente))),
+        nombre:         r.v_ah_nombre ?? '',
+        horizonte:      r.horizonte,
+        scoreGlobal:    parseFloat(r.sg),
+        prob10d:        parseFloat(r.prob_10d ?? '0'),
+        prob20d:        parseFloat(r.prob_20d ?? '0'),
+        prob30d:        parseFloat(r.prob_30d ?? '0'),
+        montoEnRiesgo:  parseFloat(parseFloat(r.saldo_capital  ?? '0').toFixed(2)),
+        saldoPromedio:  parseFloat(parseFloat(r.saldo_promedio ?? '0').toFixed(2)),
+        factorPrincipal: r.factor_principal ?? '',
+        senalPrincipal:  r.senal_principal  ?? '',
+        nivelRiesgo:     r.nivel_riesgo,
+      }));
+
+      return { resumen, data, page, limit, total: resumen.totalGeneral };
+    } catch (error) {
+      this.logger.error('Error en getPredictions', error);
+      throw error;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Cuotas Próximas en Riesgo (ventana 7, 15, 30 días)
+  // ─────────────────────────────────────────────────────────────────────────────
+  async getCuotasEnRiesgo(
+    page:      number,
+    limit:     number,
+    ventana:   number = 30,   // días hacia adelante
+    prioridad?: string,       // 'CRÍTICA' | 'ALTA' | 'MEDIA' | 'BAJA'
+  ): Promise<CuotasRiesgoResponseDto> {
+    try {
+      const offset = (page - 1) * limit;
+      const prioridadFilter = prioridad ? `AND prioridad = '${prioridad}'` : '';
+
+      const baseSql = `
+        WITH max_credito AS (
+          SELECT MAX(qy_fechaproc) AS fecha FROM sabana_credito
+        ),
+        cuotas AS (
+          SELECT
+            COALESCE(c.nro_cliente, '')                                       AS nro_cliente,
+            COALESCE(c.nombres_socio, '')                                     AS nombres_socio,
+            COALESCE(c.nro_operacion, '')                                     AS nro_operacion,
+            COALESCE(c.calificacion, '')                                      AS calificacion,
+            COALESCE(c.saldo_capital, 0)                                      AS saldo_capital,
+            COALESCE(c.saldo_por_vencer, 0)                                   AS saldo_por_vencer,
+            COALESCE(CAST(NULLIF(c.dias_mora, '') AS FLOAT), 0)               AS dias_mora,
+            COALESCE(CAST(NULLIF(c.nro_cuotas, '') AS FLOAT), 12)             AS nro_cuotas_total,
+            COALESCE(CAST(NULLIF(c.nro_cuotas_atra, '') AS FLOAT), 0)         AS cuotas_atra,
+            COALESCE(CAST(NULLIF(c.dia_pago, '') AS INT), 15)                 AS dia_pago_num,
+            c.fecha_ult_pag,
+            c.fecha_concesion_op,
+            c.fecha_fin_op,
+            COALESCE(c.destino_op, '')                                        AS destino_op,
+            COALESCE(c.actividad_socio, '')                                   AS actividad_socio,
+            COALESCE(c.plazo, '')                                             AS plazo,
+
+            -- ─ Próxima fecha de pago ─
+            -- Tomamos el último pago (o la concesión) + 1 mes, ajustamos al dia_pago
+            (
+              DATE_TRUNC('month',
+                COALESCE(c.fecha_ult_pag, c.fecha_concesion_op, NOW()) + INTERVAL '1 month'
+              ) +
+              (LEAST(
+                COALESCE(CAST(NULLIF(c.dia_pago,'') AS INT), 15),
+                DATE_PART('days',
+                  DATE_TRUNC('month',
+                    COALESCE(c.fecha_ult_pag, c.fecha_concesion_op, NOW()) + INTERVAL '2 month'
+                  ) - INTERVAL '1 day'
+                )::INT
+              ) - 1) * INTERVAL '1 day'
+            )::DATE AS fecha_prox_pago,
+
+            -- ─ Cuota estimada ─
+            ROUND(CAST(
+              COALESCE(c.saldo_por_vencer, c.saldo_capital, 0) /
+              GREATEST(
+                COALESCE(CAST(NULLIF(c.nro_cuotas,'') AS FLOAT), 12) -
+                COALESCE(CAST(NULLIF(c.nro_cuotas_atra,'') AS FLOAT), 0),
+                1
+              )
+            AS NUMERIC), 2) AS cuota_estimada,
+
+            -- ─ Score de riesgo por calificación ─
+            CASE c.calificacion
+              WHEN 'A1' THEN 10  WHEN 'A2' THEN 25  WHEN 'A3' THEN 40
+              WHEN 'B1' THEN 55  WHEN 'B2' THEN 70  WHEN 'C1' THEN 80
+              WHEN 'C2' THEN 90  WHEN 'D'  THEN 95  WHEN 'E'  THEN 100
+              ELSE 30
+            END AS score_riesgo,
+
+            -- ─ Nivel de riesgo textual ─
+            CASE c.calificacion
+              WHEN 'A1' THEN 'Bajo'     WHEN 'A2' THEN 'Bajo'
+              WHEN 'A3' THEN 'Medio'    WHEN 'B1' THEN 'Medio'
+              WHEN 'B2' THEN 'Alto'     WHEN 'C1' THEN 'Alto'
+              WHEN 'C2' THEN 'Crítico'  WHEN 'D'  THEN 'Crítico'
+              WHEN 'E'  THEN 'Crítico'  ELSE 'Sin clasificar'
+            END AS nivel_riesgo
+
+          FROM sabana_credito c
+          WHERE c.qy_fechaproc = (SELECT fecha FROM max_credito)
+            AND c.estado_op = 'VIGENTE'
+            AND c.saldo_capital IS NOT NULL
+            AND c.saldo_capital > 0
+        ),
+        resultado AS (
+          SELECT
+            *,
+            -- ─ Días hasta el pago (negativo = ya vencida) ─
+            (fecha_prox_pago - NOW()::DATE)::INT AS dias_hasta_pago,
+
+            -- ─ Prioridad de atención ─
+            CASE
+              WHEN score_riesgo >= 80
+                   AND (fecha_prox_pago - NOW()::DATE) <= 7   THEN 'CRÍTICA'
+              WHEN score_riesgo >= 55
+                   AND (fecha_prox_pago - NOW()::DATE) <= 15  THEN 'ALTA'
+              WHEN score_riesgo >= 40
+                   AND (fecha_prox_pago - NOW()::DATE) <= 30  THEN 'MEDIA'
+              ELSE 'BAJA'
+            END AS prioridad
+          FROM cuotas
+          WHERE (fecha_prox_pago - NOW()::DATE) BETWEEN -10 AND 30
+        )
+      `;
+
+      // ─── Query paginada ────────────────────────────────────────────────────
+      const sql = `
+        ${baseSql}
+        SELECT
+          nro_cliente, nombres_socio, nro_operacion,
+          fecha_prox_pago::TEXT AS fecha_prox_pago,
+          dias_hasta_pago, cuota_estimada,
+          saldo_capital, saldo_por_vencer,
+          calificacion, nivel_riesgo, dias_mora,
+          prioridad, destino_op, actividad_socio, plazo,
+          cuotas_atra AS cuotas_atrasadas,
+          fecha_ult_pag::TEXT AS fecha_ult_pag
+        FROM resultado
+        WHERE dias_hasta_pago <= $3
+          ${prioridadFilter}
+        ORDER BY
+          CASE prioridad
+            WHEN 'CRÍTICA' THEN 1 WHEN 'ALTA' THEN 2
+            WHEN 'MEDIA'   THEN 3 ELSE 4
+          END,
+          dias_hasta_pago ASC,
+          score_riesgo DESC
+        LIMIT $1 OFFSET $2;
+      `;
+
+      // ─── Query resumen ─────────────────────────────────────────────────────
+      const sqlResumen = `
+        ${baseSql}
+        SELECT
+          COUNT(*) FILTER (WHERE dias_hasta_pago BETWEEN -10 AND 7)  AS total_7d,
+          COUNT(*) FILTER (WHERE dias_hasta_pago BETWEEN -10 AND 15) AS total_15d,
+          COUNT(*) FILTER (WHERE dias_hasta_pago BETWEEN -10 AND 30) AS total_30d,
+          COUNT(*) FILTER (WHERE prioridad = 'CRÍTICA')              AS total_critica,
+          COALESCE(SUM(cuota_estimada) FILTER (WHERE dias_hasta_pago BETWEEN -10 AND 7),  0) AS monto_7d,
+          COALESCE(SUM(cuota_estimada) FILTER (WHERE dias_hasta_pago BETWEEN -10 AND 15), 0) AS monto_15d,
+          COALESCE(SUM(cuota_estimada) FILTER (WHERE dias_hasta_pago BETWEEN -10 AND 30), 0) AS monto_30d
+        FROM resultado;
+      `;
+
+      const [rows, [res]] = await Promise.all([
+        this.sabanaAhorroRepo.query(sql, [limit, offset, ventana]),
+        this.sabanaAhorroRepo.query(sqlResumen),
+      ]);
+
+      const resumen: CuotasRiesgoResumenDto = {
+        total7d:       parseInt(res?.total_7d      ?? '0', 10),
+        total15d:      parseInt(res?.total_15d     ?? '0', 10),
+        total30d:      parseInt(res?.total_30d     ?? '0', 10),
+        totalCritica:  parseInt(res?.total_critica ?? '0', 10),
+        monto7d:       parseFloat(parseFloat(res?.monto_7d  ?? '0').toFixed(2)),
+        monto15d:      parseFloat(parseFloat(res?.monto_15d ?? '0').toFixed(2)),
+        monto30d:      parseFloat(parseFloat(res?.monto_30d ?? '0').toFixed(2)),
+      };
+
+      const data: CuotaRiesgoDto[] = rows.map((r: any) => ({
+        nroCliente:      String(r.nro_cliente ?? ''),
+        nombresSocio:    r.nombres_socio ?? '',
+        nroOperacion:    r.nro_operacion ?? '',
+        fechaProxPago:   r.fecha_prox_pago ?? '',
+        diasHastaPago:   parseInt(r.dias_hasta_pago ?? '0', 10),
+        cuotaEstimada:   parseFloat(parseFloat(r.cuota_estimada ?? '0').toFixed(2)),
+        saldoCapital:    parseFloat(parseFloat(r.saldo_capital  ?? '0').toFixed(2)),
+        saldoPorVencer:  parseFloat(parseFloat(r.saldo_por_vencer ?? '0').toFixed(2)),
+        calificacion:    r.calificacion  ?? '',
+        nivelRiesgo:     r.nivel_riesgo  ?? '',
+        diasMora:        parseFloat(r.dias_mora ?? '0'),
+        prioridad:       r.prioridad     ?? 'BAJA',
+        destinoOp:       r.destino_op    ?? '',
+        actividadSocio:  r.actividad_socio ?? '',
+        plazo:           r.plazo         ?? '',
+        cuotasAtrasadas: parseFloat(r.cuotas_atrasadas ?? '0'),
+        fechaUltPago:    r.fecha_ult_pag ?? null,
+      }));
+
+      const total = ventana <= 7 ? resumen.total7d
+                  : ventana <= 15 ? resumen.total15d
+                  : resumen.total30d;
+
+      return { resumen, data, page, limit, total };
+    } catch (error) {
+      this.logger.error('Error en getCuotasEnRiesgo', error);
       throw error;
     }
   }
