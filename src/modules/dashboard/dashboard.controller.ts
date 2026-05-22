@@ -19,6 +19,7 @@ import {
   GlobalBalancesDto,
   PreventiveActionSocioDto,
   ActiveCreditsResponseDto,
+  DelinquencyRiskResponseDto,
 } from './dto/dashboard-response.dto';
 
 @ApiTags('Dashboard')
@@ -116,5 +117,28 @@ export class DashboardController {
 
     return this.dashboardService.getActiveCredits(pageNum, limitNum, search);
   }
-}
 
+  @Get('delinquency-risk')
+  @ApiOperation({
+    summary: 'Riesgo de morosidad por socio',
+    description: 'Calcula el score de riesgo de morosidad individual para cada socio desglosado en 5 dimensiones: Comportamiento Transaccional (20%), Perfil Crediticio (35%), Estabilidad Ahorro (25%), Factores Externos (10%) y Señales de Deterioro (10%). Retorna la lista paginada con la distribución por nivel de riesgo.',
+  })
+  @ApiQuery({ name: 'page',  required: false, example: 1,  description: 'Número de página (por defecto: 1)' })
+  @ApiQuery({ name: 'limit', required: false, example: 20, description: 'Límite de registros por página (por defecto: 20)' })
+  @ApiQuery({ name: 'nivel', required: false, example: 'Alto', description: 'Filtrar por nivel: Bajo | Medio | Alto | Crítico' })
+  @ApiResponse({ status: 200, type: DelinquencyRiskResponseDto })
+  getDelinquencyRisk(
+    @Query('page')  page?:  string,
+    @Query('limit') limit?: string,
+    @Query('nivel') nivel?: string,
+  ): Promise<DelinquencyRiskResponseDto> {
+    const pageNum  = page  ? parseInt(page,  10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 20;
+
+    if (isNaN(pageNum)  || pageNum  <= 0) throw new BadRequestException('El parámetro page debe ser mayor a 0');
+    if (isNaN(limitNum) || limitNum <= 0) throw new BadRequestException('El parámetro limit debe ser mayor a 0');
+    if (limitNum > 100) throw new BadRequestException('El parámetro limit no puede superar 100');
+
+    return this.dashboardService.getDelinquencyRisk(pageNum, limitNum, nivel);
+  }
+}
