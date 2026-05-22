@@ -51,7 +51,10 @@ export class DimensionScoreDto {
   @ApiProperty({ example: 'Perfil Crediticio', description: 'Nombre de la dimensión' })
   dimension: string;
 
-  @ApiProperty({ example: 0.35, description: 'Peso de la dimensión en el score global (0-1)' })
+  @ApiProperty({ example: 'Interna', description: 'Clasificación: Interna (datos coop) | Externa (perfil socio)' })
+  tipo: string;
+
+  @ApiProperty({ example: 0.25, description: 'Peso de la dimensión en el score global (0-1)' })
   peso: number;
 
   @ApiProperty({ example: 18.5, description: 'Score de la dimensión (0-100)' })
@@ -71,6 +74,12 @@ export class SocioRiesgoDto {
   @ApiProperty({ example: 42.3, description: 'Score global de riesgo (0-100)' })
   scoreGlobal: number;
 
+  @ApiProperty({ example: 38.5, description: 'Score de dimensiones internas normalizado (0-100): Transaccional + Ahorro + Crediticio + Deterioro' })
+  scoreInterno: number;
+
+  @ApiProperty({ example: 51.2, description: 'Score de dimensiones externas normalizado (0-100): Socioecón. + Actividad + Garantías' })
+  scoreExterno: number;
+
   @ApiProperty({ example: 'Medio', description: 'Nivel de riesgo: Bajo / Medio / Alto / Crítico' })
   nivelRiesgo: string;
 
@@ -83,7 +92,7 @@ export class SocioRiesgoDto {
   @ApiProperty({ example: 34.7, description: 'Probabilidad de caer en mora calculada a partir del score global mediante función sigmoide (%)' })
   probabilidadMora: number;
 
-  @ApiProperty({ type: [DimensionScoreDto], description: 'Desglose por cada dimensión de riesgo' })
+  @ApiProperty({ type: [DimensionScoreDto], description: 'Desglose por las 7 dimensiones de riesgo (4 internas + 3 externas)' })
   dimensiones: DimensionScoreDto[];
 }
 

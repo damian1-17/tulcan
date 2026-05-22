@@ -183,10 +183,11 @@ export class DashboardService {
           ORDER BY v_ah_cliente
         ),
 
-        -- ─── Perfil crediticio en el corte más reciente ───────────────────────
+        -- ─── Perfil crediticio + datos socioeconómicos del socio ───────────────
         credit_profile AS (
           SELECT
             nro_cliente,
+            -- Historial crediticio interno
             MAX(CASE calificacion
               WHEN 'A1' THEN 5  WHEN 'A2' THEN 25 WHEN 'A3' THEN 45
               WHEN 'B1' THEN 60 WHEN 'B2' THEN 75
@@ -195,12 +196,20 @@ export class DashboardService {
               ELSE 0 END)                                                AS cal_score,
             MAX(COALESCE(CAST(NULLIF(dias_mora,'') AS FLOAT), 0))       AS max_dias_mora,
             MAX(COALESCE(CAST(NULLIF(nro_cuotas_atra,'') AS FLOAT), 0)) AS max_cuotas_atra,
+            -- Factores socioeconómicos externos
             MAX(COALESCE(CAST(NULLIF(nro_cargas_fam,'') AS FLOAT), 0))  AS max_cargas,
-            MAX(CASE tipo_vivien
-              WHEN 'ARRENDADA' THEN 30 WHEN 'PROPIA' THEN 0
-              WHEN 'FAMILIAR'  THEN 15 ELSE 10 END)                     AS vivienda_score,
             MAX(COALESCE(CAST(NULLIF(ingresos_socio,'') AS FLOAT), 0))  AS ingresos,
-            MAX(COALESCE(CAST(NULLIF(egresos_socio,'')  AS FLOAT), 0))  AS egresos
+            MAX(COALESCE(CAST(NULLIF(egresos_socio,'')  AS FLOAT), 0))  AS egresos,
+            MAX(COALESCE(tipo_vivien,  ''))                              AS tipo_vivien,
+            MAX(COALESCE(nivel_educa,  ''))                             AS nivel_educa,
+            MAX(COALESCE(estado_civil, ''))                             AS estado_civil,
+            -- Actividad económica externa
+            MAX(COALESCE(actividad_socio, ''))                          AS actividad_socio,
+            MAX(COALESCE(destino_op,     ''))                           AS destino_op,
+            -- Garantías
+            MAX(COALESCE(tgarantia, ''))                                AS tgarantia,
+            MAX(COALESCE(CAST(NULLIF(valgarantias,'') AS FLOAT), 0))    AS valgarantias,
+            MAX(COALESCE(CAST(NULLIF(monto_credito,'') AS FLOAT), 0))   AS monto_credito_max
           FROM sabana_credito
           WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
           GROUP BY nro_cliente
@@ -227,14 +236,14 @@ export class DashboardService {
           GROUP BY v_ah_cliente
         ),
 
-        -- ─── Scoring por socio ────────────────────────────────────────────────
+        -- ─── Scoring por socio (7 dimensiones: 4 internas + 3 externas) ─────
         scoring AS (
           SELECT
             a.v_ah_cliente,
             a.v_ah_nombre,
             COALESCE(av.saldo_promedio, a.saldo_disponible) AS saldo_promedio,
 
-            /* D1: Comportamiento Transaccional (20%) */
+            /* ─ D1: Comportamiento Transaccional (15%) ─ INTERNA */
             LEAST(100, GREATEST(0,
               CASE
                 WHEN tx.num_tx IS NULL  THEN 75
@@ -250,7 +259,22 @@ export class DashboardService {
               END
             )) AS d1_transaccional,
 
-            /* D2: Perfil Crediticio (35%) */
+            /* ─ D2: Estabilidad de Ahorro (20%) ─ INTERNA */
+            LEAST(100, GREATEST(0,
+              CASE
+                WHEN p.saldo_prev IS NULL OR p.saldo_prev <= 0 THEN
+                  CASE WHEN a.saldo_disponible < 50 THEN 60 ELSE 15 END
+                WHEN ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.70 THEN 90
+                WHEN ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.50 THEN 70
+                WHEN ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.25 THEN 45
+                WHEN a.saldo_disponible < 50  THEN 35
+                WHEN a.monto_bloq > 0         THEN 20
+                WHEN a.saldo_disponible > p.saldo_prev THEN 5
+                ELSE 10
+              END
+            )) AS d2_ahorro,
+
+            /* ─ D3: Historial Crediticio (25%) ─ INTERNA */
             COALESCE(
               LEAST(100,
                 (c.cal_score * 0.50) +
@@ -269,44 +293,9 @@ export class DashboardService {
                 END * 0.20)
               ),
               0
-            ) AS d2_crediticio,
+            ) AS d3_credito,
 
-            /* D3: Estabilidad de Ahorro (25%) */
-            LEAST(100, GREATEST(0,
-              CASE
-                WHEN p.saldo_prev IS NULL OR p.saldo_prev <= 0 THEN
-                  CASE WHEN a.saldo_disponible < 50 THEN 60 ELSE 15 END
-                WHEN ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.70 THEN 90
-                WHEN ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.50 THEN 70
-                WHEN ((p.saldo_prev - a.saldo_disponible) / p.saldo_prev) >= 0.25 THEN 45
-                WHEN a.saldo_disponible < 50  THEN 35
-                WHEN a.monto_bloq > 0         THEN 20
-                WHEN a.saldo_disponible > p.saldo_prev THEN 5
-                ELSE 10
-              END
-            )) AS d3_ahorro,
-
-            /* D4: Factores Externos (10%) */
-            COALESCE(
-              LEAST(100,
-                (CASE
-                  WHEN c.max_cargas = 0            THEN 0
-                  WHEN c.max_cargas BETWEEN 1 AND 2 THEN 15
-                  WHEN c.max_cargas BETWEEN 3 AND 4 THEN 35
-                  ELSE 60
-                END * 0.40) +
-                (c.vivienda_score * 0.20) +
-                (CASE
-                  WHEN c.ingresos = 0 THEN 50
-                  WHEN (c.egresos / NULLIF(c.ingresos, 0)) > 0.85 THEN 70
-                  WHEN (c.egresos / NULLIF(c.ingresos, 0)) > 0.60 THEN 35
-                  ELSE 10
-                END * 0.40)
-              ),
-              20
-            ) AS d4_externo,
-
-            /* D5: Señales de Deterioro (10%) */
+            /* ─ D4: Señales de Deterioro (10%) ─ INTERNA */
             LEAST(100, GREATEST(0,
               CASE WHEN COALESCE(c.max_dias_mora, 0) > 0
                         AND p.saldo_prev IS NOT NULL
@@ -318,11 +307,95 @@ export class DashboardService {
                    THEN 60 ELSE 0 END +
               CASE WHEN a.monto_bloq > 0 AND COALESCE(c.max_dias_mora, 0) > 0
                    THEN 40 ELSE 0 END
-            )) AS d5_deterioro,
+            )) AS d4_deterioro,
 
-            /* Señal principal — señal específica con valores reales de la BD */
+            /* ─ D5: Perfil Socioeconómico (15%) ─ EXTERNA */
+            LEAST(100, GREATEST(0,
+              (CASE
+                WHEN COALESCE(c.ingresos, 0) = 0          THEN 45
+                WHEN (c.egresos / NULLIF(c.ingresos,0)) > 0.85 THEN 65
+                WHEN (c.egresos / NULLIF(c.ingresos,0)) > 0.60 THEN 35
+                ELSE 10
+              END * 0.30) +
+              (CASE
+                WHEN c.max_cargas = 0                        THEN 0
+                WHEN c.max_cargas BETWEEN 1 AND 2            THEN 15
+                WHEN c.max_cargas BETWEEN 3 AND 4            THEN 35
+                ELSE 55
+              END * 0.20) +
+              (CASE UPPER(COALESCE(c.tipo_vivien,''))
+                WHEN 'PROPIA'    THEN 0
+                WHEN 'FAMILIAR'  THEN 15
+                WHEN 'ARRENDADA' THEN 30
+                ELSE 20
+              END * 0.15) +
+              (CASE
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('SUPERIOR','POSTGRADO','TERCER NIVEL','4TO NIVEL','CUARTO NIVEL') THEN 5
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('BACHILLERATO','SECUNDARIA','BACHILLER') THEN 15
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('PRIMARIA','BASICA','BÁSICA') THEN 28
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('NINGUNA','NINGUNO') THEN 45
+                WHEN c.nivel_educa IS NULL OR c.nivel_educa = '' THEN 25
+                ELSE 20
+              END * 0.20) +
+              (CASE
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('CASADO','CASADA','UNION LIBRE','UNION DE HECHO','UNIÓN LIBRE') THEN 5
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('SOLTERO','SOLTERA') THEN 15
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('DIVORCIADO','DIVORCIADA','SEPARADO','SEPARADA') THEN 22
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('VIUDO','VIUDA') THEN 28
+                WHEN c.estado_civil IS NULL OR c.estado_civil = '' THEN 15
+                ELSE 15
+              END * 0.15)
+            )) AS d5_socioeconomico,
+
+            /* ─ D6: Actividad Económica (10%) ─ EXTERNA */
+            LEAST(100, GREATEST(0,
+              (CASE
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%AGRICULTUR%' THEN 40
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%GANADERIA%'  THEN 38
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%PESCA%'      THEN 42
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%CONSTRUCCI%' THEN 30
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%COMERCIO%'   THEN 25
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%SERVICIO%'   THEN 20
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%INDUSTRI%'   THEN 22
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%ARTESANAL%'  THEN 30
+                WHEN c.actividad_socio IS NULL OR c.actividad_socio = ''       THEN 35
+                ELSE 28
+              END * 0.50) +
+              (CASE
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%VIVIENDA%'     THEN 10
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%CAPITAL%'      THEN 20
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%PRODUCTI%'     THEN 18
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%CONSUMO%'      THEN 35
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%AGRICULT%'     THEN 38
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%COMERCI%'      THEN 25
+                WHEN c.destino_op IS NULL OR c.destino_op = ''              THEN 30
+                ELSE 28
+              END * 0.50)
+            )) AS d6_actividad,
+
+            /* ─ D7: Garantías y Patrimonio (5%) ─ EXTERNA */
+            LEAST(100, GREATEST(0,
+              (CASE
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%HIPOTECARIA%'    THEN 5
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%PRENDARIA%'      THEN 15
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%PERSONAL%'       THEN 25
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%QUIROGRAFARIA%'  THEN 35
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%QUIROG%'         THEN 35
+                WHEN c.tgarantia IS NULL OR c.tgarantia = ''                 THEN 40
+                ELSE 30
+              END * 0.60) +
+              (CASE
+                WHEN COALESCE(c.monto_credito_max,0) = 0                              THEN 35
+                WHEN c.valgarantias >= c.monto_credito_max * 1.5                      THEN 5
+                WHEN c.valgarantias >= c.monto_credito_max                            THEN 12
+                WHEN c.valgarantias >= c.monto_credito_max * 0.5                      THEN 25
+                WHEN c.valgarantias > 0                                               THEN 40
+                ELSE 55
+              END * 0.40)
+            )) AS d7_garantias,
+
+            /* Señal principal */
             CASE
-              /* 1. Mora activa + caída severa de ahorros (señal combinada crítica) */
               WHEN COALESCE(c.max_dias_mora, 0) > 30
                    AND p.saldo_prev > 0
                    AND a.saldo_disponible < p.saldo_prev * 0.75
@@ -445,25 +518,38 @@ export class DashboardService {
           LEFT JOIN avg_saldo      av ON a.v_ah_cliente = av.v_ah_cliente
         ),
 
-        -- ─── Score global por socio ───────────────────────────────────────────
+        -- ─── Score global + scores normalizados por grupo ─────────────────────────────────
         resultado AS (
           SELECT
             v_ah_cliente,
             v_ah_nombre,
             d1_transaccional,
-            d2_crediticio,
-            d3_ahorro,
-            d4_externo,
-            d5_deterioro,
+            d2_ahorro,
+            d3_credito,
+            d4_deterioro,
+            d5_socioeconomico,
+            d6_actividad,
+            d7_garantias,
             senal_principal,
             saldo_promedio,
+            -- Score global ponderado (suma de 7 dimensiones)
             ROUND(CAST(
-              (d1_transaccional * 0.20) +
-              (d2_crediticio    * 0.35) +
-              (d3_ahorro        * 0.25) +
-              (d4_externo       * 0.10) +
-              (d5_deterioro     * 0.10)
-            AS NUMERIC), 2) AS score_global
+              (d1_transaccional  * 0.15) +
+              (d2_ahorro         * 0.20) +
+              (d3_credito        * 0.25) +
+              (d4_deterioro      * 0.10) +
+              (d5_socioeconomico * 0.15) +
+              (d6_actividad      * 0.10) +
+              (d7_garantias      * 0.05)
+            AS NUMERIC), 2) AS score_global,
+            -- Score interno: dimensiones 1-4 normalizadas sobre su peso total (0.70)
+            ROUND(CAST(
+              ((d1_transaccional * 0.15) + (d2_ahorro * 0.20) + (d3_credito * 0.25) + (d4_deterioro * 0.10)) / 0.70
+            AS NUMERIC), 2) AS score_interno,
+            -- Score externo: dimensiones 5-7 normalizadas sobre su peso total (0.30)
+            ROUND(CAST(
+              ((d5_socioeconomico * 0.15) + (d6_actividad * 0.10) + (d7_garantias * 0.05)) / 0.30
+            AS NUMERIC), 2) AS score_externo
           FROM scoring
         )
 
@@ -471,13 +557,17 @@ export class DashboardService {
           v_ah_cliente,
           v_ah_nombre,
           d1_transaccional,
-          d2_crediticio,
-          d3_ahorro,
-          d4_externo,
-          d5_deterioro,
+          d2_ahorro,
+          d3_credito,
+          d4_deterioro,
+          d5_socioeconomico,
+          d6_actividad,
+          d7_garantias,
           senal_principal,
           saldo_promedio,
           score_global,
+          score_interno,
+          score_externo,
           ROUND(CAST(
             100.0 / (1.0 + EXP(-0.09 * (score_global - 45)))
           AS NUMERIC), 1) AS prob_mora,
@@ -521,10 +611,16 @@ export class DashboardService {
             MAX(COALESCE(CAST(NULLIF(dias_mora,'') AS FLOAT), 0))        AS max_dias_mora,
             MAX(COALESCE(CAST(NULLIF(nro_cuotas_atra,'') AS FLOAT), 0))  AS max_cuotas_atra,
             MAX(COALESCE(CAST(NULLIF(nro_cargas_fam,'') AS FLOAT), 0))   AS max_cargas,
-            MAX(CASE tipo_vivien WHEN 'ARRENDADA' THEN 30 WHEN 'PROPIA' THEN 0
-              WHEN 'FAMILIAR' THEN 15 ELSE 10 END)                        AS vivienda_score,
             MAX(COALESCE(CAST(NULLIF(ingresos_socio,'') AS FLOAT), 0))   AS ingresos,
-            MAX(COALESCE(CAST(NULLIF(egresos_socio,'')  AS FLOAT), 0))   AS egresos
+            MAX(COALESCE(CAST(NULLIF(egresos_socio,'')  AS FLOAT), 0))   AS egresos,
+            MAX(COALESCE(tipo_vivien,  ''))                               AS tipo_vivien,
+            MAX(COALESCE(nivel_educa,  ''))                               AS nivel_educa,
+            MAX(COALESCE(estado_civil, ''))                               AS estado_civil,
+            MAX(COALESCE(actividad_socio, ''))                            AS actividad_socio,
+            MAX(COALESCE(destino_op,     ''))                             AS destino_op,
+            MAX(COALESCE(tgarantia, ''))                                  AS tgarantia,
+            MAX(COALESCE(CAST(NULLIF(valgarantias,'') AS FLOAT), 0))      AS valgarantias,
+            MAX(COALESCE(CAST(NULLIF(monto_credito,'') AS FLOAT), 0))     AS monto_credito_max
           FROM sabana_credito WHERE qy_fechaproc = (SELECT fecha FROM max_credito)
           GROUP BY nro_cliente
         ),
@@ -556,28 +652,73 @@ export class DashboardService {
               WHEN a.saldo_disponible<50 THEN 35 WHEN a.monto_bloq>0 THEN 20
               WHEN a.saldo_disponible>p.saldo_prev THEN 5 ELSE 10 END
             )) AS d3,
-            COALESCE(LEAST(100,
-              (CASE WHEN c.max_cargas=0 THEN 0 WHEN c.max_cargas<=2 THEN 15
-                WHEN c.max_cargas<=4 THEN 35 ELSE 60 END*0.40)+
-              (c.vivienda_score*0.20)+
-              (CASE WHEN c.ingresos=0 THEN 50
-                WHEN (c.egresos/NULLIF(c.ingresos,0))>0.85 THEN 70
-                WHEN (c.egresos/NULLIF(c.ingresos,0))>0.60 THEN 35
-                ELSE 10 END*0.40)),20) AS d4,
+            /* D4: Señales de deterioro */
             LEAST(100,GREATEST(0,
               CASE WHEN COALESCE(c.max_dias_mora,0)>0 AND p.saldo_prev IS NOT NULL
                 AND a.saldo_disponible<p.saldo_prev*0.75 THEN 90 ELSE 0 END+
               CASE WHEN tx.num_tx IS NULL AND p.saldo_prev IS NOT NULL
                 AND a.saldo_disponible<p.saldo_prev*0.80 THEN 60 ELSE 0 END+
               CASE WHEN a.monto_bloq>0 AND COALESCE(c.max_dias_mora,0)>0 THEN 40 ELSE 0 END
-            )) AS d5
+            )) AS d4,
+            /* D5: Perfil socioeconómico */
+            LEAST(100,GREATEST(0,
+              (CASE WHEN COALESCE(c.ingresos,0)=0 THEN 45
+                WHEN (c.egresos/NULLIF(c.ingresos,0))>0.85 THEN 65
+                WHEN (c.egresos/NULLIF(c.ingresos,0))>0.60 THEN 35 ELSE 10 END*0.30)+
+              (CASE WHEN c.max_cargas=0 THEN 0 WHEN c.max_cargas<=2 THEN 15
+                WHEN c.max_cargas<=4 THEN 35 ELSE 55 END*0.20)+
+              (CASE UPPER(COALESCE(c.tipo_vivien,'')) WHEN 'PROPIA' THEN 0
+                WHEN 'FAMILIAR' THEN 15 WHEN 'ARRENDADA' THEN 30 ELSE 20 END*0.15)+
+              (CASE WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('SUPERIOR','POSTGRADO','TERCER NIVEL','4TO NIVEL','CUARTO NIVEL') THEN 5
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('BACHILLERATO','SECUNDARIA','BACHILLER') THEN 15
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('PRIMARIA','BASICA','BÁSICA') THEN 28
+                WHEN UPPER(COALESCE(c.nivel_educa,'')) IN ('NINGUNA','NINGUNO') THEN 45
+                WHEN c.nivel_educa IS NULL OR c.nivel_educa='' THEN 25 ELSE 20 END*0.20)+
+              (CASE WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('CASADO','CASADA','UNION LIBRE','UNION DE HECHO','UNIÓN LIBRE') THEN 5
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('SOLTERO','SOLTERA') THEN 15
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('DIVORCIADO','DIVORCIADA','SEPARADO','SEPARADA') THEN 22
+                WHEN UPPER(COALESCE(c.estado_civil,'')) IN ('VIUDO','VIUDA') THEN 28
+                ELSE 15 END*0.15)
+            )) AS d5,
+            /* D6: Actividad económica */
+            LEAST(100,GREATEST(0,
+              (CASE WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%AGRICULTUR%' THEN 40
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%GANADERIA%' THEN 38
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%PESCA%' THEN 42
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%CONSTRUCCI%' THEN 30
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%COMERCIO%' THEN 25
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%SERVICIO%' THEN 20
+                WHEN UPPER(COALESCE(c.actividad_socio,'')) LIKE '%INDUSTRI%' THEN 22
+                WHEN c.actividad_socio IS NULL OR c.actividad_socio='' THEN 35 ELSE 28 END*0.50)+
+              (CASE WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%VIVIENDA%' THEN 10
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%CAPITAL%' THEN 20
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%PRODUCTI%' THEN 18
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%CONSUMO%' THEN 35
+                WHEN UPPER(COALESCE(c.destino_op,'')) LIKE '%AGRICULT%' THEN 38
+                WHEN c.destino_op IS NULL OR c.destino_op='' THEN 30 ELSE 28 END*0.50)
+            )) AS d6,
+            /* D7: Garantías */
+            LEAST(100,GREATEST(0,
+              (CASE WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%HIPOTECARIA%' THEN 5
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%PRENDARIA%' THEN 15
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%PERSONAL%' THEN 25
+                WHEN UPPER(COALESCE(c.tgarantia,'')) LIKE '%QUIROG%' THEN 35
+                WHEN c.tgarantia IS NULL OR c.tgarantia='' THEN 40 ELSE 30 END*0.60)+
+              (CASE WHEN COALESCE(c.monto_credito_max,0)=0 THEN 35
+                WHEN c.valgarantias>=c.monto_credito_max*1.5 THEN 5
+                WHEN c.valgarantias>=c.monto_credito_max THEN 12
+                WHEN c.valgarantias>=c.monto_credito_max*0.5 THEN 25
+                WHEN c.valgarantias>0 THEN 40 ELSE 55 END*0.40)
+            )) AS d7
           FROM base_ahorro a
           LEFT JOIN prev_base      p  ON a.v_ah_cliente = p.v_ah_cliente
           LEFT JOIN credit_profile c  ON CAST(a.v_ah_cliente AS BIGINT)::TEXT = c.nro_cliente
           LEFT JOIN tx_activity    tx ON a.v_ah_cliente = tx.v_ah_cliente
         ),
         resultado AS (
-          SELECT ROUND(CAST((d1*0.20)+(d2*0.35)+(d3*0.25)+(d4*0.10)+(d5*0.10) AS NUMERIC),2) AS sg
+          SELECT ROUND(CAST(
+            (d1*0.15)+(d2*0.20)+(d3*0.25)+(d4*0.10)+(d5*0.15)+(d6*0.10)+(d7*0.05)
+          AS NUMERIC),2) AS sg
           FROM scoring
         )
         SELECT
@@ -624,24 +765,32 @@ export class DashboardService {
       const dist = distRows[0];
 
       const data: SocioRiesgoDto[] = rows.map((r: any) => {
-        const d1 = parseFloat(r.d1_transaccional ?? '0');
-        const d2 = parseFloat(r.d2_crediticio    ?? '0');
-        const d3 = parseFloat(r.d3_ahorro        ?? '0');
-        const d4 = parseFloat(r.d4_externo       ?? '0');
-        const d5 = parseFloat(r.d5_deterioro     ?? '0');
+        const d1 = parseFloat(r.d1_transaccional    ?? '0');
+        const d2 = parseFloat(r.d2_ahorro           ?? '0');
+        const d3 = parseFloat(r.d3_credito          ?? '0');
+        const d4 = parseFloat(r.d4_deterioro        ?? '0');
+        const d5 = parseFloat(r.d5_socioeconomico   ?? '0');
+        const d6 = parseFloat(r.d6_actividad        ?? '0');
+        const d7 = parseFloat(r.d7_garantias        ?? '0');
 
         const dimensiones: DimensionScoreDto[] = [
-          { dimension: 'Comportamiento Transaccional', peso: 0.20, score: parseFloat(d1.toFixed(2)), contribucion: parseFloat((d1 * 0.20).toFixed(2)) },
-          { dimension: 'Perfil Crediticio',            peso: 0.35, score: parseFloat(d2.toFixed(2)), contribucion: parseFloat((d2 * 0.35).toFixed(2)) },
-          { dimension: 'Estabilidad Ahorro',           peso: 0.25, score: parseFloat(d3.toFixed(2)), contribucion: parseFloat((d3 * 0.25).toFixed(2)) },
-          { dimension: 'Factores Externos',            peso: 0.10, score: parseFloat(d4.toFixed(2)), contribucion: parseFloat((d4 * 0.10).toFixed(2)) },
-          { dimension: 'Señales de Deterioro',         peso: 0.10, score: parseFloat(d5.toFixed(2)), contribucion: parseFloat((d5 * 0.10).toFixed(2)) },
+          // ─ INTERNAS ─
+          { tipo: 'Interna', dimension: 'Comportamiento Transaccional', peso: 0.15, score: parseFloat(d1.toFixed(2)), contribucion: parseFloat((d1 * 0.15).toFixed(2)) },
+          { tipo: 'Interna', dimension: 'Estabilidad de Ahorro',        peso: 0.20, score: parseFloat(d2.toFixed(2)), contribucion: parseFloat((d2 * 0.20).toFixed(2)) },
+          { tipo: 'Interna', dimension: 'Historial Crediticio',         peso: 0.25, score: parseFloat(d3.toFixed(2)), contribucion: parseFloat((d3 * 0.25).toFixed(2)) },
+          { tipo: 'Interna', dimension: 'Señales de Deterioro',         peso: 0.10, score: parseFloat(d4.toFixed(2)), contribucion: parseFloat((d4 * 0.10).toFixed(2)) },
+          // ─ EXTERNAS ─
+          { tipo: 'Externa', dimension: 'Perfil Socioeconómico',        peso: 0.15, score: parseFloat(d5.toFixed(2)), contribucion: parseFloat((d5 * 0.15).toFixed(2)) },
+          { tipo: 'Externa', dimension: 'Actividad Económica',          peso: 0.10, score: parseFloat(d6.toFixed(2)), contribucion: parseFloat((d6 * 0.10).toFixed(2)) },
+          { tipo: 'Externa', dimension: 'Garantías y Patrimonio',       peso: 0.05, score: parseFloat(d7.toFixed(2)), contribucion: parseFloat((d7 * 0.05).toFixed(2)) },
         ];
 
         return {
           nroCliente:       String(Math.floor(parseFloat(r.v_ah_cliente))),
           nombre:           r.v_ah_nombre ?? '',
           scoreGlobal:      parseFloat(r.score_global),
+          scoreInterno:     parseFloat(parseFloat(r.score_interno ?? '0').toFixed(2)),
+          scoreExterno:     parseFloat(parseFloat(r.score_externo ?? '0').toFixed(2)),
           nivelRiesgo:      r.nivel_riesgo,
           senalPrincipal:   r.senal_principal ?? 'Sin señal crítica identificada',
           saldoPromedio:    parseFloat(parseFloat(r.saldo_promedio ?? '0').toFixed(2)),
