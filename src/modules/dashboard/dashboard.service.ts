@@ -2,17 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 
-import { EtlControl }     from './entities/etl-control.entity';
 import { SabanaAhorro }   from './entities/sabana-ahorro.entity';
-import { Transaccion }    from './entities/transaccion.entity';
 import { SabanaCredito }  from './entities/sabana-credito.entity';
 
 import {
-  EtlStatusDto,
-  EtlRecentFileDto,
-  DemographicsSummaryDto,
-  SexoGroupDto,
-  TransactionVolumeDto,
   ActiveCreditDto,
   ActiveCreditsResponseDto,
   DelinquencyRiskResponseDto,
@@ -26,220 +19,13 @@ export class DashboardService {
   private readonly logger = new Logger(DashboardService.name);
 
   constructor(
-    @InjectRepository(EtlControl, 'SEGURIDAD_DB')
-    private readonly etlControlRepo: Repository<EtlControl>,
-
     @InjectRepository(SabanaAhorro, 'SEGURIDAD_DB')
     private readonly sabanaAhorroRepo: Repository<SabanaAhorro>,
-
-    @InjectRepository(Transaccion, 'SEGURIDAD_DB')
-    private readonly transaccionRepo: Repository<Transaccion>,
 
     @InjectRepository(SabanaCredito, 'SEGURIDAD_DB')
     private readonly sabanaCreditoRepo: Repository<SabanaCredito>,
   ) {}
 
-  // ─── KPI 1: Estado del ETL ─────────────────────────────────────────────────
-
-  /**
-   * Retorna el estado del pipeline de ingesta de datos:
-   * - Últimos 5 archivos procesados (nombre, tipo, filas, fecha)
-   * - Total acumulado de filas cargadas en la historia
-   * - Timestamp de la ejecución más reciente
-   *
-   * Útil para que Gerencia y Riesgos validen la frescura de los datos
-   * antes de tomar decisiones basadas en el dashboard.
-   */
-  async getEtlStatus(): Promise<EtlStatusDto> {
-    try {
-      // Últimos 5 archivos ordenados por fecha descendente
-      const ultimosArchivos = await this.etlControlRepo
-        .createQueryBuilder('e')
-        .select(['e.nombre', 'e.tipo', 'e.filas', 'e.cargadoEn'])
-        .orderBy('e.cargadoEn', 'DESC')
-        .limit(5)
-        .getMany();
-
-      // Agregaciones en una sola consulta para eficiencia
-      const agregados = await this.etlControlRepo
-        .createQueryBuilder('e')
-        .select('SUM(e.filas)', 'totalFilas')
-        .addSelect('MAX(e.cargadoEn)', 'ultimaEjecucion')
-        .getRawOne<{ totalFilas: string; ultimaEjecucion: string }>();
-
-      const mapped: EtlRecentFileDto[] = ultimosArchivos.map((r) => ({
-        nombre:    r.nombre,
-        tipo:      r.tipo,
-        filas:     r.filas,
-        cargadoEn: r.cargadoEn,
-      }));
-
-      return {
-        ultimosArchivos:      mapped,
-        totalFilasHistoricas: parseInt(agregados?.totalFilas ?? '0', 10),
-        ultimaEjecucion:      agregados?.ultimaEjecucion
-                                ? new Date(agregados.ultimaEjecucion)
-                                : null,
-      };
-    } catch (error) {
-      this.logger.error('Error en getEtlStatus', error);
-      throw error;
-    }
-  }
-
-  // ─── KPI 2: Resumen demográfico ────────────────────────────────────────────
-
-  /**
-   * Analiza el perfil demográfico de los socios desde la sábana de ahorro.
-   *
-   * Agrupa por sexo para obtener:
-   * - Conteo de registros
-   * - Promedio de edad
-   * - Promedio de ingresos declarados
-   *
-   * NOTA: sabana_ahorro tiene múltiples cortes históricos por cliente.
-   * Para evitar inflar los promedios, se trabaja sobre TODOS los registros
-   * tal como están. Si se necesita el perfil del corte más reciente
-   * solamente, agregar un filtro por MAX(fecha_proceso).
-   */
-  async getDemographicsSummary(): Promise<DemographicsSummaryDto> {
-    try {
-      // 1. Obtener la fecha del corte más reciente
-      const maxFechaRaw = await this.sabanaAhorroRepo
-        .createQueryBuilder('a')
-        .select('MAX(a.fechaProceso)', 'maxFecha')
-        .getRawOne<{ maxFecha: string }>();
-
-      const maxFecha = maxFechaRaw?.maxFecha ? new Date(maxFechaRaw.maxFecha) : null;
-
-      if (!maxFecha) {
-        return {
-          porSexo: [],
-          promedioEdadGlobal: 0,
-          totalRegistros: 0,
-        };
-      }
-
-      // 2. Agrupación por sexo con métricas sobre socios únicos
-      const porSexoRaw = await this.sabanaAhorroRepo.query(`
-        WITH unique_socios AS (
-          SELECT v_ah_cliente, 
-                 MAX(sexo) as sexo, 
-                 MAX(CAST(CASE WHEN edad ~ '^[0-9]+(\\.[0-9]+)?$' THEN edad ELSE NULL END AS FLOAT)) as edad
-          FROM sabana_ahorro
-          WHERE fecha_proceso = $1
-          GROUP BY v_ah_cliente
-        )
-        SELECT sexo, 
-               COUNT(*) as total, 
-               AVG(edad) as promedio_edad
-        FROM unique_socios
-        WHERE sexo IN ('F', 'M')
-        GROUP BY sexo;
-      `, [maxFecha]);
-
-      // 3. Métricas globales sobre socios únicos (solo sexo F/M para consistencia)
-      const globalRaw = await this.sabanaAhorroRepo.query(`
-        WITH unique_socios AS (
-          SELECT v_ah_cliente, 
-                 MAX(sexo) as sexo,
-                 MAX(CAST(CASE WHEN edad ~ '^[0-9]+(\\.[0-9]+)?$' THEN edad ELSE NULL END AS FLOAT)) as edad
-          FROM sabana_ahorro
-          WHERE fecha_proceso = $1
-          GROUP BY v_ah_cliente
-        )
-        SELECT COUNT(*) as total, 
-               AVG(edad) as promedio_edad
-        FROM unique_socios
-        WHERE sexo IN ('F', 'M');
-      `, [maxFecha]);
-
-      const porSexo: SexoGroupDto[] = porSexoRaw.map((r: any) => ({
-        sexo:         r.sexo,
-        total:        parseInt(r.total ?? '0', 10),
-        promedioEdad: parseFloat(parseFloat(r.promedio_edad ?? '0').toFixed(2)),
-      }));
-
-      const global = globalRaw && globalRaw.length > 0 ? globalRaw[0] : null;
-
-      return {
-        porSexo,
-        promedioEdadGlobal: parseFloat(parseFloat(global?.promedio_edad ?? '0').toFixed(2)),
-        totalRegistros:     parseInt(global?.total ?? '0', 10),
-      };
-    } catch (error) {
-      this.logger.error('Error en getDemographicsSummary', error);
-      throw error;
-    }
-  }
-
-  // ─── KPI 3: Volumen transaccional por período ──────────────────────────────
-
-  /**
-   * Calcula el volumen de transacciones en un rango de fechas.
-   *
-   * Desglosa el total entre:
-   * - Créditos (signo_nc_nd = 'C'): entradas de dinero
-   * - Débitos  (signo_nc_nd = 'D'): salidas de dinero
-   *
-   * Permite a Crédito y Cobranza detectar períodos de baja actividad
-   * transaccional, que es una señal temprana de riesgo de mora.
-   *
-   * @param startDate Fecha de inicio del período (ISO string o Date)
-   * @param endDate   Fecha de fin del período (ISO string o Date)
-   */
-  async getTransactionVolume(
-    startDate: string | Date,
-    endDate: string | Date,
-  ): Promise<TransactionVolumeDto> {
-    try {
-      const start = new Date(startDate);
-      const end   = new Date(endDate);
-
-      // Métricas globales del período
-      const globalRaw = await this.transaccionRepo
-        .createQueryBuilder('t')
-        .select('COUNT(*)',                          'totalTransacciones')
-        .addSelect('SUM(CAST(t.valorTrn AS FLOAT))', 'sumaValorTotal')
-        .addSelect('AVG(CAST(t.valorTrn AS FLOAT))', 'promedioValor')
-        .where('t.fechaTrn BETWEEN :start AND :end', { start, end })
-        .getRawOne<{
-          totalTransacciones: string;
-          sumaValorTotal: string;
-          promedioValor: string;
-        }>();
-
-      // Suma de créditos (C) y débitos (D) por separado
-      const porSignoRaw = await this.transaccionRepo
-        .createQueryBuilder('t')
-        .select('t.signoNcNd',                       'signo')
-        .addSelect('SUM(CAST(t.valorTrn AS FLOAT))', 'suma')
-        .where('t.fechaTrn BETWEEN :start AND :end', { start, end })
-        .andWhere('t.signoNcNd IN (:...signos)',     { signos: ['C', 'D'] })
-        .groupBy('t.signoNcNd')
-        .getRawMany<{ signo: string; suma: string }>();
-
-      const totalCreditos = parseFloat(
-        porSignoRaw.find((r) => r.signo === 'C')?.suma ?? '0',
-      );
-      const totalDebitos = parseFloat(
-        porSignoRaw.find((r) => r.signo === 'D')?.suma ?? '0',
-      );
-
-      return {
-        desde:               start.toISOString().split('T')[0]?? '',
-        hasta:               end.toISOString().split('T')[0]?? '',
-        totalTransacciones:  parseInt(globalRaw?.totalTransacciones ?? '0', 10),
-        sumaValorTotal:      parseFloat(parseFloat(globalRaw?.sumaValorTotal ?? '0').toFixed(2)),
-        promedioValor:       parseFloat(parseFloat(globalRaw?.promedioValor ?? '0').toFixed(2)),
-        totalCreditos:       parseFloat(totalCreditos.toFixed(2)),
-        totalDebitos:        parseFloat(totalDebitos.toFixed(2)),
-      };
-    } catch (error) {
-      this.logger.error('Error en getTransactionVolume', error);
-      throw error;
-    }
-  }
 
   /**
    * Obtiene la lista paginada de socios con crédito activo en el corte más reciente.
